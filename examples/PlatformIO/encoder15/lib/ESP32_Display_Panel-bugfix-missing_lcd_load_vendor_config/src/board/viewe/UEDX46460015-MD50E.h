@@ -34,7 +34,7 @@
 #define ESP_PANEL_LCD_NAME          SH8601
 
 /* LCD resolution in pixels */
-#define ESP_PANEL_LCD_WIDTH         (471)
+#define ESP_PANEL_LCD_WIDTH         (472)
 #define ESP_PANEL_LCD_HEIGHT        (466)
 
 /* LCD Bus Settings */

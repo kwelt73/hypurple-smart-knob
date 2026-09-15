@@ -1,111 +1,414 @@
-/**
- * # LVGL Porting Example
- *
- * The example demonstrates how to port LVGL(v8). And for RGB LCD, it can enable the avoid tearing function.
- *
- * ## How to Use
- *
- * To use this example, please firstly install the following dependent libraries:
- *
- * - lvgl (>= v8.3.9, < v9)
- * - ESP32_Display_Panel (> 0.2.1)
- * - ESP32_IO_Expander (>= 0.1.0 && < 0.2.0)
- * - ESP32_Knob (>= 0.1.3)
- * - ESP32_Button (>= 3.1.2)
- *
- * Then follow the steps below to configure:
- *
- * Follow the steps below to configure:
- *
- * 1. For **ESP32_Display_Panel**:
- *
- *     `Note`:Since the latest version is still being updated and has not been released, please temporarily use the test version in this repository: `Libraries`->[`ESP32_Display_Panel`](https://github.com/VIEWESMART/UEDX46460015-MD50ESP32-1.5inch-Touch-Knob-Display/tree/main/Libraries/ESP32_Display_Panel-bugfix-missing_lcd_load_vendor_config).
- *
- *     - Follow the [steps](https://github.com/VIEWESMART/VIEWE-FAQ/tree/main/Arduino-FAQ/English/How_To_Use.md#configuring-drivers) to configure drivers if needed.
- *     - If using a supported development board, follow the [steps](https://github.com/VIEWESMART/VIEWE-FAQ/tree/main/Arduino-FAQ/English/How_To_Use.md#using-supported-development-boards) to configure it.
- *     - If using a custom board, follow the [steps](https://github.com/VIEWESMART/VIEWE-FAQ/tree/main/Arduino-FAQ/English/How_To_Use.md#using-custom-development-boards) to configure it.
- *
- * 2. For **lvgl**:
- *
- *     - Follow the [steps](https://github.com/VIEWESMART/VIEWE-FAQ/blob/main/Arduino-FAQ/English/FAQ.md#how-to-add-an-lvgl-library-and-how-to-configure) to add *lv_conf.h* file and change the configurations.
- *     - Modify the macros in the [lvgl_port_v8.h](./lvgl_port_v8.h) file to configure the LVGL porting parameters.
- *
- * 3. Navigate to the `Tools` menu in the Arduino IDE to choose a ESP board and configure its parameters. For supported
- *    boards, please refter to [Configuring Supported Development Boards](https://github.com/esp-arduino-libs/ESP32_Display_Panel/blob/master/docs/How_To_Use.md#configuring-supported-development-boards)
- * 4. Verify and upload the example to your ESP board.
- *
- * ## Serial Output
- *
- * ```bash
- * ...
- * LVGL porting example start
- * Initialize panel device
- * Initialize LVGL
- * Create UI
- * LVGL porting example end
- * IDLE loop
- * IDLE loop
- * ...
- * ```
- *
- * ## Troubleshooting
- *
- * Please check the [FAQ](https://github.com/VIEWESMART/VIEWE-FAQ/tree/main/Arduino-FAQ/English/FAQ.md) first to see if the same question exists. If not, please create a [Github issue](https://github.com/VIEWESMART/VIEWE-FAQ/issues). We will get back to you as soon as possible.
- *
- */
-
 #include <Arduino.h>
+#include <Button.h>
+#include <ESP_Knob.h>
 #include <ESP_Panel_Library.h>
 #include <lvgl.h>
+
+#include "controller_client.h"
+#include "fonts/hypurple_fonts.h"
 #include "lvgl_port_v8.h"
 
-/**
-/* To use the built-in examples and demos of LVGL uncomment the includes below respectively.
- * You also need to copy `lvgl/examples` to `lvgl/src/examples`. Similarly for the demos `lvgl/demos` to `lvgl/src/demos`.
- */
-#include <demos/lv_demos.h>
-// #include <examples/lv_examples.h>
-#include <ESP_Knob.h>
-#include <Button.h>
+namespace {
 
-/*Initialize UI start*/
-/*Initialize UI end*/
+constexpr uint32_t kWelcomeDurationMs = 2000;
+constexpr int kPumpValueMin = 0;
+constexpr int kPumpValueMax = 100;
+constexpr bool kShowColorDiagnostics = false;
 
-#include <ui.h>
+struct HardwareScreenStyle {
+    uint32_t accent_color;
+    uint32_t background_color;
+    uint32_t primary_text_color;
+    uint32_t secondary_text_color;
+    uint32_t track_color;
+    lv_coord_t ring_diameter;
+    lv_coord_t ring_width;
+    const lv_font_t *label_font;
+    const lv_font_t *value_font;
+    const lv_font_t *unit_font;
+};
 
-ESP_Knob *knob;
-void onKnobLeftEventCallback(int count, void *usr_data)
+// Resolved from the web Smart Knob's 466 x 466 HMI tokens.
+constexpr HardwareScreenStyle kPumpStyle = {
+    .accent_color = 0xC78B28,
+    .background_color = 0x030100,
+    .primary_text_color = 0xFEFBF9,
+    .secondary_text_color = 0x8D8B89,
+    .track_color = 0x211F1E,
+    .ring_diameter = 390,
+    .ring_width = 14,
+    .label_font = &hypurple_geist_semibold_22,
+    .value_font = &hypurple_geist_mono_semibold_84,
+    .unit_font = &hypurple_geist_mono_medium_29,
+};
+
+enum class HmiScreen {
+    Pump,
+    ColorDiagnostics,
+};
+
+enum class HmiPhase {
+    Welcome,
+    Interactive,
+};
+
+ESP_Knob *knob = nullptr;
+Button *button = nullptr;
+HypurpleControllerClient controller_client;
+
+HmiPhase hmi_phase = HmiPhase::Welcome;
+HmiScreen active_screen = HmiScreen::Pump;
+PumpControlState pump_state = resetPumpState();
+
+lv_obj_t *welcome_screen = nullptr;
+lv_obj_t *pump_screen = nullptr;
+lv_obj_t *color_test_screen = nullptr;
+lv_obj_t *pump_arc = nullptr;
+lv_obj_t *pump_value_label = nullptr;
+lv_obj_t *pump_percent_label = nullptr;
+lv_obj_t *pump_pause_label = nullptr;
+lv_obj_t *pump_zero_marker = nullptr;
+lv_obj_t *pump_connection_dot = nullptr;
+lv_obj_t *pump_offline_label = nullptr;
+bool pump_controller_connected = false;
+
+void configureScreen(lv_obj_t *screen, uint32_t background_color)
 {
-    Serial.printf("Detect left event, count is %d\n", count);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(background_color), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+}
+
+void createWelcomeScreen()
+{
+    welcome_screen = lv_obj_create(nullptr);
+    configureScreen(welcome_screen, 0x000000);
+
+    lv_obj_t *brand = lv_label_create(welcome_screen);
+    lv_label_set_text(brand, "H Y P U R P L E");
+    lv_obj_set_style_text_color(brand, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(brand, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(brand, 2, 0);
+    lv_obj_center(brand);
+}
+
+void updatePumpScreen()
+{
+    lv_label_set_text_fmt(pump_value_label, "%d", pump_state.desired_percent);
+    lv_arc_set_value(pump_arc, pump_state.desired_percent);
+    lv_obj_align(pump_value_label, LV_ALIGN_CENTER, -17, 3);
+    lv_obj_align_to(pump_percent_label, pump_value_label, LV_ALIGN_OUT_RIGHT_MID, 5, 18);
+    lv_obj_set_style_arc_color(pump_arc, lv_color_hex(kPumpStyle.accent_color), LV_PART_INDICATOR);
+
+    if (pump_state.paused && pump_state.desired_percent > 0) {
+        lv_obj_clear_flag(pump_pause_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(pump_pause_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (pump_state.desired_percent == 0) {
+        lv_obj_clear_flag(pump_zero_marker, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(pump_zero_marker, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void updatePumpConnectionIndicator(bool connected)
+{
+    pump_controller_connected = connected;
+    lv_obj_set_style_bg_color(
+        pump_connection_dot,
+        lv_color_hex(connected ? 0x4F9B69 : 0x65615F),
+        0);
+    if (connected) {
+        lv_obj_add_flag(pump_offline_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(pump_offline_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void createPumpScreen()
+{
+    pump_screen = lv_obj_create(nullptr);
+    configureScreen(pump_screen, kPumpStyle.background_color);
+
+    pump_arc = lv_arc_create(pump_screen);
+    lv_obj_set_size(pump_arc, kPumpStyle.ring_diameter, kPumpStyle.ring_diameter);
+    lv_obj_center(pump_arc);
+    lv_arc_set_rotation(pump_arc, 270);
+    lv_arc_set_bg_angles(pump_arc, 0, 360);
+    lv_arc_set_range(pump_arc, kPumpValueMin, kPumpValueMax);
+    lv_obj_remove_style(pump_arc, nullptr, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(pump_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_border_width(pump_arc, 0, LV_PART_KNOB);
+    lv_obj_set_style_outline_width(pump_arc, 0, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(pump_arc, 0, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(pump_arc, 0, LV_PART_KNOB);
+    lv_obj_clear_flag(pump_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(pump_arc, kPumpStyle.ring_width, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(pump_arc, lv_color_hex(kPumpStyle.track_color), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(pump_arc, kPumpStyle.ring_width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(pump_arc, lv_color_hex(kPumpStyle.accent_color), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(pump_arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(pump_arc, true, LV_PART_INDICATOR);
+
+    pump_zero_marker = lv_obj_create(pump_screen);
+    lv_obj_set_size(pump_zero_marker, 8, 8);
+    lv_obj_set_style_radius(pump_zero_marker, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(pump_zero_marker, lv_color_hex(kPumpStyle.accent_color), 0);
+    lv_obj_set_style_bg_opa(pump_zero_marker, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(pump_zero_marker, 0, 0);
+    lv_obj_set_style_pad_all(pump_zero_marker, 0, 0);
+    lv_obj_clear_flag(pump_zero_marker, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(pump_zero_marker, LV_ALIGN_CENTER, 0, -(kPumpStyle.ring_diameter / 2 - kPumpStyle.ring_width / 2));
+
+    lv_obj_t *title = lv_label_create(pump_screen);
+    lv_label_set_text(title, "PUMPE");
+    lv_obj_set_style_text_color(title, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(title, kPumpStyle.label_font, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -69);
+
+    pump_value_label = lv_label_create(pump_screen);
+    lv_obj_set_style_text_color(pump_value_label, lv_color_hex(kPumpStyle.primary_text_color), 0);
+    lv_obj_set_style_text_font(pump_value_label, kPumpStyle.value_font, 0);
+
+    pump_percent_label = lv_label_create(pump_screen);
+    lv_label_set_text(pump_percent_label, "%");
+    lv_obj_set_style_text_color(pump_percent_label, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(pump_percent_label, kPumpStyle.unit_font, 0);
+
+    pump_pause_label = lv_label_create(pump_screen);
+    lv_label_set_text(pump_pause_label, "PAUSE");
+    lv_obj_set_style_text_color(pump_pause_label, lv_color_hex(kPumpStyle.accent_color), 0);
+    lv_obj_set_style_text_font(pump_pause_label, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(pump_pause_label, 2, 0);
+    lv_obj_align(pump_pause_label, LV_ALIGN_CENTER, 0, 75);
+
+    pump_connection_dot = lv_obj_create(pump_screen);
+    lv_obj_set_size(pump_connection_dot, 7, 7);
+    lv_obj_set_style_radius(pump_connection_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(pump_connection_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(pump_connection_dot, 0, 0);
+    lv_obj_set_style_pad_all(pump_connection_dot, 0, 0);
+    lv_obj_clear_flag(pump_connection_dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(pump_connection_dot, LV_ALIGN_CENTER, -37, 119);
+
+    pump_offline_label = lv_label_create(pump_screen);
+    lv_label_set_text(pump_offline_label, "OFFLINE");
+    lv_obj_set_style_text_color(pump_offline_label, lv_color_hex(0x65615F), 0);
+    lv_obj_set_style_text_font(pump_offline_label, &hypurple_geist_semibold_14, 0);
+    lv_obj_set_style_text_letter_space(pump_offline_label, 1, 0);
+    lv_obj_align(pump_offline_label, LV_ALIGN_CENTER, 3, 119);
+
+    updatePumpScreen();
+    updatePumpConnectionIndicator(false);
+}
+
+struct ColorTestCell {
+    const char *label;
+    uint32_t background;
+    uint32_t foreground;
+};
+
+constexpr ColorTestCell kColorTestCells[] = {
+    {"RED", 0xFF0000, 0xFFFFFF},
+    {"GREEN", 0x00FF00, 0x000000},
+    {"BLUE", 0x0000FF, 0xFFFFFF},
+    {"WHITE", 0xFFFFFF, 0x000000},
+    {"GRAY", 0x808080, 0xFFFFFF},
+    {"AMBER", 0xC78B28, 0x000000},
+};
+
+void createColorTestCell(
+    lv_obj_t *parent,
+    const ColorTestCell &cell,
+    lv_coord_t x,
+    lv_coord_t y,
+    lv_coord_t width,
+    lv_coord_t height)
+{
+    lv_obj_t *field = lv_obj_create(parent);
+    lv_obj_set_pos(field, x, y);
+    lv_obj_set_size(field, width, height);
+    lv_obj_clear_flag(field, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(field, lv_color_hex(cell.background), 0);
+    lv_obj_set_style_bg_opa(field, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(field, 0, 0);
+    lv_obj_set_style_outline_width(field, 0, 0);
+    lv_obj_set_style_shadow_width(field, 0, 0);
+    lv_obj_set_style_pad_all(field, 0, 0);
+    lv_obj_set_style_radius(field, 0, 0);
+
+    lv_obj_t *label = lv_label_create(field);
+    lv_label_set_text(label, cell.label);
+    lv_obj_set_style_text_color(label, lv_color_hex(cell.foreground), 0);
+    lv_obj_set_style_text_font(label, &hypurple_geist_semibold_14, 0);
+    lv_obj_center(label);
+}
+
+void createFontTestRow(lv_obj_t *parent, const char *size_label, const lv_font_t *font, lv_coord_t y)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, size_label);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x808080), 0);
+    lv_obj_set_style_text_font(label, &hypurple_geist_semibold_14, 0);
+    lv_obj_set_pos(label, 52, y + 4);
+
+    lv_obj_t *sample = lv_label_create(parent);
+    lv_label_set_text(sample, "PUMPE");
+    lv_obj_set_style_text_color(sample, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(sample, font, 0);
+    lv_obj_set_pos(sample, 154, y);
+}
+
+void createColorTestScreen()
+{
+    color_test_screen = lv_obj_create(nullptr);
+    configureScreen(color_test_screen, 0x000000);
+
+    constexpr lv_coord_t kGridHeight = 246;
+    constexpr lv_coord_t kCellHeight = kGridHeight / 2;
+    constexpr lv_coord_t kCellWidth = ESP_PANEL_LCD_WIDTH / 3;
+
+    for (size_t index = 0; index < 6; ++index) {
+        const lv_coord_t column = index % 3;
+        const lv_coord_t row = index / 3;
+        const lv_coord_t x = column * kCellWidth;
+        const lv_coord_t width = column == 2 ? ESP_PANEL_LCD_WIDTH - x : kCellWidth;
+        createColorTestCell(
+            color_test_screen,
+            kColorTestCells[index],
+            x,
+            row * kCellHeight,
+            width,
+            kCellHeight);
+    }
+
+    createFontTestRow(color_test_screen, "14 PX", &hypurple_geist_semibold_14, 258);
+    createFontTestRow(color_test_screen, "18 PX", &hypurple_geist_semibold_18, 301);
+    createFontTestRow(color_test_screen, "22 PX", &hypurple_geist_semibold_22, 346);
+    createFontTestRow(color_test_screen, "26 PX", &hypurple_geist_semibold_26, 395);
+}
+
+void showPumpScreen()
+{
+    lv_scr_load(pump_screen);
+    active_screen = HmiScreen::Pump;
+    hmi_phase = HmiPhase::Interactive;
+    Serial.println("Pump screen");
+}
+
+void showPostWelcomeScreen(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (kShowColorDiagnostics) {
+        lv_scr_load(color_test_screen);
+        active_screen = HmiScreen::ColorDiagnostics;
+        hmi_phase = HmiPhase::Interactive;
+        Serial.println("Color test screen");
+    } else {
+        showPumpScreen();
+    }
+
+    if (welcome_screen != nullptr) {
+        lv_obj_del_async(welcome_screen);
+        welcome_screen = nullptr;
+    }
+}
+
+void adjustPumpValue(int delta)
+{
     lvgl_port_lock(-1);
-    LVGL_knob_event((void*)KNOB_LEFT);
+
+    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    const PumpControlState next_state = adjustPumpState(pump_state, delta);
+
+    if (next_state.desired_percent == pump_state.desired_percent) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    pump_state = next_state;
+    updatePumpScreen();
+    lvgl_port_unlock();
+
+    controller_client.setDesiredPumpState(pump_state);
+
+    Serial.printf("Pump value %d%%\n", pump_state.desired_percent);
+}
+
+void applyControllerPumpState(const PumpControlState &state)
+{
+    lvgl_port_lock(-1);
+    pump_state = normalizePumpState(state);
+    updatePumpScreen();
     lvgl_port_unlock();
 }
 
-void onKnobRightEventCallback(int count, void *usr_data)
+void onKnobLeftEventCallback(int count, void *user_data)
 {
-    Serial.printf("Detect right event, count is %d\n", count);
-    lvgl_port_lock(-1);
-    LVGL_knob_event((void*)KNOB_RIGHT);
-    lvgl_port_unlock();
+    (void)count;
+    (void)user_data;
+    adjustPumpValue(-1);
 }
 
-static void SingleClickCb(void *button_handle, void *usr_data) {
-    Serial.println("Button Single Click");
-    lvgl_port_lock(-1);
-    LVGL_button_event((void*)BUTTON_SINGLE_CLICK);
-    lvgl_port_unlock();
-}
-static void DoubleClickCb(void *button_handle, void *usr_data)
+void onKnobRightEventCallback(int count, void *user_data)
 {
-    Serial.println("Button Double Click");
+    (void)count;
+    (void)user_data;
+    adjustPumpValue(1);
 }
-static void LongPressStartCb(void *button_handle, void *usr_data) {
-    Serial.println("Button Long Press Start");
+
+void onSingleClick(void *button_handle, void *user_data)
+{
+    (void)button_handle;
+    (void)user_data;
+
     lvgl_port_lock(-1);
-    LVGL_button_event((void*)BUTTON_LONG_PRESS_START);
+
+    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    if (pump_state.desired_percent == 0) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    pump_state = togglePumpPause(pump_state);
+    updatePumpScreen();
     lvgl_port_unlock();
+
+    controller_client.setDesiredPumpState(pump_state);
+
+    Serial.println(pump_state.paused ? "Pump paused" : "Pump resumed");
 }
+
+void onLongPressStart(void *button_handle, void *user_data)
+{
+    (void)button_handle;
+    (void)user_data;
+
+    lvgl_port_lock(-1);
+    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+        lvgl_port_unlock();
+        return;
+    }
+    pump_state = resetPumpState();
+    updatePumpScreen();
+    lvgl_port_unlock();
+
+    controller_client.setDesiredPumpState(pump_state);
+    Serial.println("Pump reset");
+}
+
+}  // namespace
 
 void setup()
 {
@@ -113,15 +416,14 @@ void setup()
     pinMode(17, OUTPUT);
     digitalWrite(17, HIGH);
 #endif
-    String title = "LVGL porting example";
-    Serial.begin(115200);
-    Serial.println(title + " start");
 
-    Serial.println("Initialize panel device");
+    Serial.begin(115200);
+    Serial.println("HMI boot");
+
     ESP_Panel *panel = new ESP_Panel();
     panel->init();
+
 #if LVGL_PORT_AVOID_TEAR
-    // When avoid tearing function is enabled, configure the bus according to the LVGL configuration
     ESP_PanelBus *lcd_bus = panel->getLcd()->getBus();
 #if ESP_PANEL_LCD_BUS_TYPE == ESP_PANEL_BUS_TYPE_RGB
     static_cast<ESP_PanelBus_RGB *>(lcd_bus)->configRgbBounceBufferSize(LVGL_PORT_RGB_BOUNCE_BUFFER_SIZE);
@@ -130,62 +432,45 @@ void setup()
     static_cast<ESP_PanelBus_DSI *>(lcd_bus)->configDpiFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
 #endif
 #endif
+
     panel->begin();
 
-    Serial.println("Initialize Knob device");
     knob = new ESP_Knob(GPIO_NUM_KNOB_PIN_A, GPIO_NUM_KNOB_PIN_B);
     knob->begin();
-    knob->attachLeftEventCallback(onKnobLeftEventCallback);
-    knob->attachRightEventCallback(onKnobRightEventCallback);
+    knob->attachLeftEventCallback(onKnobRightEventCallback);
+    knob->attachRightEventCallback(onKnobLeftEventCallback);
 
-    Serial.println("Initialize Button device");
-    Button *btn = new Button(GPIO_BUTTON_PIN, false);
+    button = new Button(GPIO_BUTTON_PIN, false);
+    button->attachSingleClickEventCb(&onSingleClick, nullptr);
+    button->attachLongPressStartEventCb(&onLongPressStart, nullptr);
 
-    btn->attachSingleClickEventCb(&SingleClickCb, NULL);
-    btn->attachDoubleClickEventCb(&DoubleClickCb, NULL);
-    btn->attachLongPressStartEventCb(&LongPressStartCb, NULL);
+    // Touch remains intentionally disabled; input is encoder + primary button.
+    // Future screens use swipes for navigation, the encoder for the current
+    // parameter, and the button for the primary action.
+    lvgl_port_init(panel->getLcd(), nullptr);
 
-
-    Serial.println("Initialize LVGL");
-    lvgl_port_init(panel->getLcd(), panel->getTouch());
-
-    Serial.println("Create UI");
-    /* Lock the mutex due to the LVGL APIs are not thread-safe */
     lvgl_port_lock(-1);
-
-    /**
-     * Create a simple label
-     *
-     */
-    // lv_obj_t *label = lv_label_create(lv_scr_act());
-    // lv_label_set_text(label, title.c_str());
-    // lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-  
-    /**
-     * Try an example. Don't forget to uncomment header.
-     * See all the examples online: https://docs.lvgl.io/master/examples.html
-     * source codes: https://github.com/lvgl/lvgl/tree/e7f88efa5853128bf871dde335c0ca8da9eb7731/examples
-     */
-    //  lv_example_btn_1();
-
-    /**
-     * Or try out a demo.
-     * Don't forget to uncomment header and enable the demos in `lv_conf.h`. E.g. `LV_USE_DEMO_WIDGETS`
-     */
-    // lv_demo_widgets();
-    // lv_demo_benchmark();
-    // lv_demo_music();
-    // lv_demo_stress();
-    ui_init();
-
-    /* Release the mutex */
+    createWelcomeScreen();
+    createPumpScreen();
+    createColorTestScreen();
+    lv_scr_load(welcome_screen);
+    lv_timer_t *welcome_timer = lv_timer_create(showPostWelcomeScreen, kWelcomeDurationMs, nullptr);
+    lv_timer_set_repeat_count(welcome_timer, 1);
     lvgl_port_unlock();
 
-    Serial.println(title + " end");
+    controller_client.begin(applyControllerPumpState);
+
+    Serial.println("Welcome screen");
 }
 
 void loop()
 {
-    Serial.println("IDLE loop");
+    controller_client.loop();
+    const bool connected = controller_client.connected();
+    if (connected != pump_controller_connected) {
+        lvgl_port_lock(-1);
+        updatePumpConnectionIndicator(connected);
+        lvgl_port_unlock();
+    }
     delay(50);
 }
