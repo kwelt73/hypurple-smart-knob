@@ -7,6 +7,7 @@
 #include "controller_client.h"
 #include "fonts/hypurple_fonts.h"
 #include "lvgl_port_v8.h"
+#include "smart_knob_navigation.h"
 
 namespace {
 
@@ -42,8 +43,12 @@ constexpr HardwareScreenStyle kPumpStyle = {
     .unit_font = &hypurple_geist_mono_medium_29,
 };
 
+constexpr uint32_t kCompressorAccentColor = 0x6BB9F8;
+constexpr uint32_t kCompressorTrackColor = 0xB3B2AF;
+
 enum class HmiScreen {
     Pump,
+    Compressor,
     ColorDiagnostics,
 };
 
@@ -58,7 +63,11 @@ HypurpleControllerClient controller_client;
 
 HmiPhase hmi_phase = HmiPhase::Welcome;
 HmiScreen active_screen = HmiScreen::Pump;
+SmartKnobScreenConfiguration screen_configuration = defaultSmartKnobScreenConfiguration();
+size_t active_screen_index = 0;
+int pending_screen_index = -1;
 PumpControlState pump_state = resetPumpState();
+CompressorControlState compressor_state = stoppedCompressorState();
 
 lv_obj_t *welcome_screen = nullptr;
 lv_obj_t *pump_screen = nullptr;
@@ -70,7 +79,18 @@ lv_obj_t *pump_pause_label = nullptr;
 lv_obj_t *pump_zero_marker = nullptr;
 lv_obj_t *pump_connection_dot = nullptr;
 lv_obj_t *pump_offline_label = nullptr;
+lv_obj_t *compressor_screen = nullptr;
+lv_obj_t *compressor_arc = nullptr;
+lv_obj_t *compressor_value_label = nullptr;
+lv_obj_t *compressor_percent_label = nullptr;
+lv_obj_t *compressor_off_label = nullptr;
+lv_obj_t *compressor_pause_label = nullptr;
+lv_obj_t *compressor_zero_marker = nullptr;
+lv_obj_t *compressor_connection_dot = nullptr;
+lv_obj_t *compressor_offline_label = nullptr;
 bool pump_controller_connected = false;
+
+void handleScreenGesture(lv_event_t *event);
 
 void configureScreen(lv_obj_t *screen, uint32_t background_color)
 {
@@ -124,6 +144,39 @@ void updatePumpConnectionIndicator(bool connected)
     } else {
         lv_obj_clear_flag(pump_offline_label, LV_OBJ_FLAG_HIDDEN);
     }
+    if (compressor_connection_dot != nullptr) {
+        lv_obj_set_style_bg_color(
+            compressor_connection_dot,
+            lv_color_hex(connected ? 0x4F9B69 : 0x65615F),
+            0);
+        lv_obj_align(
+            compressor_connection_dot,
+            LV_ALIGN_CENTER,
+            connected ? 0 : -37,
+            kCompressorDisplayGeometry.connection_y - kCompressorDisplayGeometry.center);
+    }
+    if (compressor_offline_label != nullptr) {
+        if (connected) {
+            lv_obj_add_flag(compressor_offline_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(compressor_offline_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void alignCompressorValue(lv_coord_t y)
+{
+    constexpr lv_coord_t kUnitGap = 5;
+    constexpr lv_coord_t kUnitBaselineOffset = 18;
+    lv_obj_update_layout(compressor_percent_label);
+    const lv_coord_t unit_offset = -(lv_obj_get_width(compressor_percent_label) + kUnitGap) / 2;
+    lv_obj_align(compressor_value_label, LV_ALIGN_CENTER, unit_offset, y);
+    lv_obj_align_to(
+        compressor_percent_label,
+        compressor_value_label,
+        LV_ALIGN_OUT_RIGHT_MID,
+        kUnitGap,
+        kUnitBaselineOffset);
 }
 
 void createPumpScreen()
@@ -202,6 +255,148 @@ void createPumpScreen()
 
     updatePumpScreen();
     updatePumpConnectionIndicator(false);
+    lv_obj_add_event_cb(pump_screen, handleScreenGesture, LV_EVENT_GESTURE, nullptr);
+    for (uint32_t index = 0; index < lv_obj_get_child_cnt(pump_screen); ++index) {
+        lv_obj_add_flag(lv_obj_get_child(pump_screen, index), LV_OBJ_FLAG_EVENT_BUBBLE);
+    }
+}
+
+void updateCompressorScreen()
+{
+    const int value = clampCompressorPercent(
+        compressor_state.paused ? compressor_state.resume_percent : compressor_state.actual_percent);
+    lv_arc_set_value(compressor_arc, value);
+    if (compressor_state.paused) {
+        lv_label_set_text_fmt(compressor_value_label, "%d", value);
+        lv_obj_clear_flag(compressor_value_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(compressor_percent_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(compressor_pause_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_off_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_zero_marker, LV_OBJ_FLAG_HIDDEN);
+        alignCompressorValue(
+            kCompressorDisplayGeometry.paused_value_y - kCompressorDisplayGeometry.center);
+    } else if (value == 0) {
+        lv_obj_add_flag(compressor_value_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_percent_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_pause_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(compressor_off_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(compressor_zero_marker, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text_fmt(compressor_value_label, "%d", value);
+        lv_obj_clear_flag(compressor_value_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(compressor_percent_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_pause_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_off_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(compressor_zero_marker, LV_OBJ_FLAG_HIDDEN);
+        alignCompressorValue(
+            kCompressorDisplayGeometry.running_value_y - kCompressorDisplayGeometry.center);
+    }
+}
+
+void createCompressorScreen()
+{
+    compressor_screen = lv_obj_create(nullptr);
+    configureScreen(compressor_screen, 0x000000);
+
+    compressor_arc = lv_arc_create(compressor_screen);
+    const lv_coord_t compressor_ring_diameter =
+        2 * kCompressorDisplayGeometry.ring_radius + kCompressorDisplayGeometry.progress_width;
+    lv_obj_set_size(compressor_arc, compressor_ring_diameter, compressor_ring_diameter);
+    lv_obj_center(compressor_arc);
+    lv_arc_set_rotation(compressor_arc, 270);
+    lv_arc_set_bg_angles(compressor_arc, 0, 360);
+    lv_arc_set_range(compressor_arc, 0, 100);
+    lv_obj_remove_style(compressor_arc, nullptr, LV_PART_KNOB);
+    lv_obj_clear_flag(compressor_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(compressor_arc, kCompressorDisplayGeometry.track_width, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(compressor_arc, lv_color_hex(kCompressorTrackColor), LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(compressor_arc, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(compressor_arc, kCompressorDisplayGeometry.progress_width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(compressor_arc, lv_color_hex(kCompressorAccentColor), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(compressor_arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(compressor_arc, true, LV_PART_INDICATOR);
+
+    compressor_zero_marker = lv_obj_create(compressor_screen);
+    lv_obj_set_size(
+        compressor_zero_marker,
+        2 * kCompressorDisplayGeometry.zero_marker_radius,
+        2 * kCompressorDisplayGeometry.zero_marker_radius);
+    lv_obj_set_style_radius(compressor_zero_marker, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(compressor_zero_marker, lv_color_hex(kCompressorAccentColor), 0);
+    lv_obj_set_style_bg_opa(compressor_zero_marker, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(compressor_zero_marker, 0, 0);
+    lv_obj_set_style_pad_all(compressor_zero_marker, 0, 0);
+    lv_obj_clear_flag(compressor_zero_marker, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(compressor_zero_marker, LV_ALIGN_CENTER, 0, -kCompressorDisplayGeometry.ring_radius);
+
+    lv_obj_t *title = lv_label_create(compressor_screen);
+    lv_label_set_text(title, "COMPRESSOR");
+    lv_obj_set_style_text_color(title, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(title, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(
+        title,
+        LV_ALIGN_CENTER,
+        0,
+        kCompressorDisplayGeometry.label_y - kCompressorDisplayGeometry.center);
+
+    compressor_value_label = lv_label_create(compressor_screen);
+    lv_obj_set_style_text_color(compressor_value_label, lv_color_hex(kPumpStyle.primary_text_color), 0);
+    lv_obj_set_style_text_font(compressor_value_label, kPumpStyle.value_font, 0);
+
+    compressor_percent_label = lv_label_create(compressor_screen);
+    lv_label_set_text(compressor_percent_label, "%");
+    lv_obj_set_style_text_color(compressor_percent_label, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(compressor_percent_label, kPumpStyle.unit_font, 0);
+
+    compressor_off_label = lv_label_create(compressor_screen);
+    lv_label_set_text(compressor_off_label, "OFF");
+    lv_obj_set_style_text_color(compressor_off_label, lv_color_hex(kPumpStyle.primary_text_color), 0);
+    lv_obj_set_style_text_font(compressor_off_label, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(compressor_off_label, 2, 0);
+    lv_obj_align(compressor_off_label, LV_ALIGN_CENTER, 0, 3);
+
+    compressor_pause_label = lv_label_create(compressor_screen);
+    lv_label_set_text(compressor_pause_label, "PAUSED");
+    lv_obj_set_style_text_color(compressor_pause_label, lv_color_hex(kCompressorAccentColor), 0);
+    lv_obj_set_style_text_font(compressor_pause_label, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(compressor_pause_label, 2, 0);
+    lv_obj_align(
+        compressor_pause_label,
+        LV_ALIGN_CENTER,
+        0,
+        kCompressorDisplayGeometry.paused_y - kCompressorDisplayGeometry.center);
+
+    compressor_connection_dot = lv_obj_create(compressor_screen);
+    lv_obj_set_size(compressor_connection_dot, 7, 7);
+    lv_obj_set_style_radius(compressor_connection_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(compressor_connection_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(compressor_connection_dot, 0, 0);
+    lv_obj_set_style_pad_all(compressor_connection_dot, 0, 0);
+    lv_obj_clear_flag(compressor_connection_dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(
+        compressor_connection_dot,
+        LV_ALIGN_CENTER,
+        -37,
+        kCompressorDisplayGeometry.connection_y - kCompressorDisplayGeometry.center);
+
+    compressor_offline_label = lv_label_create(compressor_screen);
+    lv_label_set_text(compressor_offline_label, "OFFLINE");
+    lv_obj_set_style_text_color(compressor_offline_label, lv_color_hex(0x65615F), 0);
+    lv_obj_set_style_text_font(compressor_offline_label, &hypurple_geist_semibold_14, 0);
+    lv_obj_set_style_text_letter_space(compressor_offline_label, 1, 0);
+    lv_obj_align(
+        compressor_offline_label,
+        LV_ALIGN_CENTER,
+        3,
+        kCompressorDisplayGeometry.connection_y - kCompressorDisplayGeometry.center);
+
+    updateCompressorScreen();
+    updatePumpConnectionIndicator(false);
+    lv_obj_add_event_cb(compressor_screen, handleScreenGesture, LV_EVENT_GESTURE, nullptr);
+    for (uint32_t index = 0; index < lv_obj_get_child_cnt(compressor_screen); ++index) {
+        lv_obj_add_flag(lv_obj_get_child(compressor_screen, index), LV_OBJ_FLAG_EVENT_BUBBLE);
+    }
 }
 
 struct ColorTestCell {
@@ -290,12 +485,76 @@ void createColorTestScreen()
     createFontTestRow(color_test_screen, "26 PX", &hypurple_geist_semibold_26, 395);
 }
 
-void showPumpScreen()
+HmiScreen toHmiScreen(SmartKnobScreenKind kind)
 {
-    lv_scr_load(pump_screen);
-    active_screen = HmiScreen::Pump;
+    switch (kind) {
+        case SmartKnobScreenKind::MiniPump:
+            return HmiScreen::Pump;
+        case SmartKnobScreenKind::CompressorFlow:
+            return HmiScreen::Compressor;
+    }
+    return HmiScreen::Pump;
+}
+
+lv_obj_t *screenObject(HmiScreen screen)
+{
+    switch (screen) {
+        case HmiScreen::Pump:
+            return pump_screen;
+        case HmiScreen::Compressor:
+            return compressor_screen;
+        case HmiScreen::ColorDiagnostics:
+            return color_test_screen;
+    }
+    return pump_screen;
+}
+
+void showConfiguredScreen(size_t index)
+{
+    if (screen_configuration.count == 0 || index >= screen_configuration.count) return;
+    active_screen_index = index;
+    active_screen = toHmiScreen(screen_configuration.screens[index]);
+    lv_scr_load(screenObject(active_screen));
     hmi_phase = HmiPhase::Interactive;
-    Serial.println("Pump screen");
+    Serial.printf("Smart Knob screen: %s\n", smartKnobScreenId(screen_configuration.screens[index]));
+}
+
+void requestConfiguredScreen(size_t index)
+{
+    if (index >= screen_configuration.count || index == active_screen_index) return;
+    if (active_screen == HmiScreen::Pump && pump_state.desired_percent > 0) {
+        pending_screen_index = static_cast<int>(index);
+        pump_state = resetPumpState();
+        updatePumpScreen();
+        controller_client.setDesiredPumpState(pump_state);
+        Serial.println("Screen change waiting for Pump STOP confirmation");
+        return;
+    }
+    if (
+        active_screen == HmiScreen::Compressor &&
+        (compressor_state.actual_percent > 0 || compressor_state.paused)
+    ) {
+        pending_screen_index = static_cast<int>(index);
+        compressor_state = stoppedCompressorState();
+        updateCompressorScreen();
+        controller_client.setDesiredCompressorState(compressor_state);
+        Serial.println("Screen change waiting for Compressor OFF confirmation");
+        return;
+    }
+    showConfiguredScreen(index);
+}
+
+void handleScreenGesture(lv_event_t *event)
+{
+    (void)event;
+    if (hmi_phase != HmiPhase::Interactive || screen_configuration.count < 2) return;
+    const lv_dir_t direction = lv_indev_get_gesture_dir(lv_indev_get_act());
+    const int step = direction == LV_DIR_LEFT ? 1 : direction == LV_DIR_RIGHT ? -1 : 0;
+    if (step == 0) return;
+    requestConfiguredScreen(resolveBoundedScreenIndex(
+        active_screen_index,
+        step,
+        screen_configuration.count));
 }
 
 void showPostWelcomeScreen(lv_timer_t *timer)
@@ -308,7 +567,7 @@ void showPostWelcomeScreen(lv_timer_t *timer)
         hmi_phase = HmiPhase::Interactive;
         Serial.println("Color test screen");
     } else {
-        showPumpScreen();
+        showConfiguredScreen(0);
     }
 
     if (welcome_screen != nullptr) {
@@ -317,11 +576,38 @@ void showPostWelcomeScreen(lv_timer_t *timer)
     }
 }
 
-void adjustPumpValue(int delta)
+void adjustActiveValue(int delta)
 {
     lvgl_port_lock(-1);
 
-    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+    if (hmi_phase != HmiPhase::Interactive) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    if (active_screen == HmiScreen::Compressor) {
+        const CompressorControlState next_state = applyCompressorDelta(compressor_state, delta);
+        if (
+            next_state.actual_percent == compressor_state.actual_percent &&
+            next_state.paused == compressor_state.paused &&
+            next_state.resume_percent == compressor_state.resume_percent
+        ) {
+            lvgl_port_unlock();
+            return;
+        }
+        compressor_state = next_state;
+        updateCompressorScreen();
+        lvgl_port_unlock();
+        controller_client.setDesiredCompressorState(compressor_state);
+        Serial.printf(
+            "Compressor command actual=%u%% paused=%s resume=%u%%\n",
+            compressor_state.actual_percent,
+            compressor_state.paused ? "true" : "false",
+            compressor_state.resume_percent);
+        return;
+    }
+
+    if (active_screen != HmiScreen::Pump) {
         lvgl_port_unlock();
         return;
     }
@@ -347,6 +633,85 @@ void applyControllerPumpState(const PumpControlState &state)
     lvgl_port_lock(-1);
     pump_state = normalizePumpState(state);
     updatePumpScreen();
+    if (pending_screen_index >= 0 && pump_state.desired_percent > 0) {
+        pump_state = resetPumpState();
+        updatePumpScreen();
+        controller_client.setDesiredPumpState(pump_state);
+        lvgl_port_unlock();
+        return;
+    }
+    if (
+        pending_screen_index >= 0 &&
+        pump_state.desired_percent == 0 &&
+        effectivePumpPercent(pump_state) == 0
+    ) {
+        const size_t target = static_cast<size_t>(pending_screen_index);
+        pending_screen_index = -1;
+        showConfiguredScreen(target);
+    }
+    lvgl_port_unlock();
+}
+
+void applyControllerCompressorState(const CompressorControlState &state)
+{
+    lvgl_port_lock(-1);
+    compressor_state = state;
+    updateCompressorScreen();
+    if (
+        pending_screen_index >= 0 &&
+        (compressor_state.actual_percent > 0 || compressor_state.paused)
+    ) {
+        compressor_state = stoppedCompressorState();
+        updateCompressorScreen();
+        controller_client.setDesiredCompressorState(compressor_state);
+        lvgl_port_unlock();
+        return;
+    }
+    if (
+        pending_screen_index >= 0 &&
+        compressor_state.actual_percent == 0 &&
+        !compressor_state.paused
+    ) {
+        const size_t target = static_cast<size_t>(pending_screen_index);
+        pending_screen_index = -1;
+        showConfiguredScreen(target);
+    }
+    lvgl_port_unlock();
+}
+
+void applyScreenConfiguration(const SmartKnobScreenConfiguration &configuration)
+{
+    lvgl_port_lock(-1);
+    const HmiScreen previous_screen = active_screen;
+    screen_configuration = configuration;
+    size_t matching_index = configuration.count;
+    for (size_t index = 0; index < configuration.count; ++index) {
+        if (toHmiScreen(configuration.screens[index]) == previous_screen) {
+            matching_index = index;
+            break;
+        }
+    }
+    if (matching_index < configuration.count) {
+        active_screen_index = matching_index;
+    } else if (
+        previous_screen == HmiScreen::Pump &&
+        pump_state.desired_percent > 0
+    ) {
+        pending_screen_index = 0;
+        pump_state = resetPumpState();
+        updatePumpScreen();
+        controller_client.setDesiredPumpState(pump_state);
+    } else if (
+        previous_screen == HmiScreen::Compressor &&
+        (compressor_state.actual_percent > 0 || compressor_state.paused)
+    ) {
+        pending_screen_index = 0;
+        compressor_state = stoppedCompressorState();
+        updateCompressorScreen();
+        controller_client.setDesiredCompressorState(compressor_state);
+    } else {
+        showConfiguredScreen(0);
+    }
     lvgl_port_unlock();
 }
 
@@ -354,14 +719,14 @@ void onKnobLeftEventCallback(int count, void *user_data)
 {
     (void)count;
     (void)user_data;
-    adjustPumpValue(-1);
+    adjustActiveValue(-1);
 }
 
 void onKnobRightEventCallback(int count, void *user_data)
 {
     (void)count;
     (void)user_data;
-    adjustPumpValue(1);
+    adjustActiveValue(1);
 }
 
 void onSingleClick(void *button_handle, void *user_data)
@@ -371,7 +736,24 @@ void onSingleClick(void *button_handle, void *user_data)
 
     lvgl_port_lock(-1);
 
-    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+    if (hmi_phase != HmiPhase::Interactive) {
+        lvgl_port_unlock();
+        return;
+    }
+
+    if (active_screen == HmiScreen::Compressor) {
+        const CompressorControlState requested_state = toggleCompressorPause(compressor_state);
+        lvgl_port_unlock();
+        controller_client.setDesiredCompressorState(requested_state);
+        Serial.printf(
+            "Compressor button actual=%u%% paused=%s resume=%u%%\n",
+            requested_state.actual_percent,
+            requested_state.paused ? "true" : "false",
+            requested_state.resume_percent);
+        return;
+    }
+
+    if (active_screen != HmiScreen::Pump) {
         lvgl_port_unlock();
         return;
     }
@@ -396,7 +778,15 @@ void onLongPressStart(void *button_handle, void *user_data)
     (void)user_data;
 
     lvgl_port_lock(-1);
-    if (hmi_phase != HmiPhase::Interactive || active_screen != HmiScreen::Pump) {
+    if (hmi_phase != HmiPhase::Interactive) {
+        lvgl_port_unlock();
+        return;
+    }
+    if (active_screen == HmiScreen::Compressor) {
+        lvgl_port_unlock();
+        return;
+    }
+    if (active_screen != HmiScreen::Pump) {
         lvgl_port_unlock();
         return;
     }
@@ -444,21 +834,22 @@ void setup()
     button->attachSingleClickEventCb(&onSingleClick, nullptr);
     button->attachLongPressStartEventCb(&onLongPressStart, nullptr);
 
-    // Touch remains intentionally disabled; input is encoder + primary button.
-    // Future screens use swipes for navigation, the encoder for the current
-    // parameter, and the button for the primary action.
-    lvgl_port_init(panel->getLcd(), nullptr);
+    lvgl_port_init(panel->getLcd(), panel->getTouch());
 
     lvgl_port_lock(-1);
     createWelcomeScreen();
     createPumpScreen();
+    createCompressorScreen();
     createColorTestScreen();
     lv_scr_load(welcome_screen);
     lv_timer_t *welcome_timer = lv_timer_create(showPostWelcomeScreen, kWelcomeDurationMs, nullptr);
     lv_timer_set_repeat_count(welcome_timer, 1);
     lvgl_port_unlock();
 
-    controller_client.begin(applyControllerPumpState);
+    controller_client.begin(
+        applyControllerPumpState,
+        applyControllerCompressorState,
+        applyScreenConfiguration);
 
     Serial.println("Welcome screen");
 }

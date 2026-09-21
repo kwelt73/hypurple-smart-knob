@@ -23,6 +23,7 @@
 namespace {
 
 constexpr uint32_t kRequestIntervalMs = 1000;
+constexpr uint32_t kCompressorCommandIntervalMs = 200;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
 constexpr uint32_t kControllerStateStaleAfterMs = 3500;
 constexpr uint16_t kHttpTimeoutMs = 750;
@@ -53,9 +54,14 @@ const cJSON *findPumpActuator(const cJSON *root)
 
 }  // namespace
 
-void HypurpleControllerClient::begin(PumpStateCallback callback)
+void HypurpleControllerClient::begin(
+    PumpStateCallback callback,
+    CompressorStateCallback compressor_callback,
+    ScreenConfigurationCallback screen_configuration_callback)
 {
     callback_ = callback;
+    compressor_callback_ = compressor_callback;
+    screen_configuration_callback_ = screen_configuration_callback;
     if (!configured()) {
         Serial.println("Controller client disabled: configuration incomplete");
         return;
@@ -96,9 +102,38 @@ void HypurpleControllerClient::loop()
         return;
     }
 
-    if (now - last_request_at_ < kRequestIntervalMs) {
+    if (!screen_configuration_loaded_) {
+        if (now - last_request_at_ < kRequestIntervalMs) return;
+        last_request_at_ = now;
+        if (!fetchScreenConfiguration()) {
+            handleCommunicationFailure();
+        }
         return;
     }
+
+    CompressorControlState compressor_state;
+    bool compressor_write_pending;
+    uint32_t compressor_revision;
+    portENTER_CRITICAL(&session_mux_);
+    compressor_state = compressor_state_;
+    compressor_write_pending = compressor_write_pending_;
+    compressor_revision = compressor_revision_;
+    portEXIT_CRITICAL(&session_mux_);
+    if (
+        compressor_write_pending &&
+        now - last_compressor_request_at_ >= kCompressorCommandIntervalMs
+    ) {
+        last_compressor_request_at_ = now;
+        if (!sendCompressorState(compressor_state, compressor_revision)) {
+            const PumpControllerSession request_session = snapshotSession();
+            if (!fetchControllerState(request_session.revision)) {
+                handleCommunicationFailure();
+            }
+        }
+        return;
+    }
+
+    if (now - last_request_at_ < kRequestIntervalMs) return;
     last_request_at_ = now;
 
     const PumpControllerSession request_session = snapshotSession();
@@ -111,7 +146,7 @@ void HypurpleControllerClient::loop()
             success = sendPumpHeartbeat(request_session.revision);
             break;
         case PumpControllerRequest::StatePoll:
-            success = fetchPumpState(request_session.revision);
+            success = fetchControllerState(request_session.revision);
             break;
     }
     if (!success) {
@@ -123,6 +158,18 @@ void HypurpleControllerClient::setDesiredPumpState(const PumpControlState &state
 {
     portENTER_CRITICAL(&session_mux_);
     session_ = applyPumpUserInteraction(session_, state);
+    portEXIT_CRITICAL(&session_mux_);
+}
+
+void HypurpleControllerClient::setDesiredCompressorState(
+    const CompressorControlState &state)
+{
+    portENTER_CRITICAL(&session_mux_);
+    compressor_state_ = state.paused && state.resume_percent >= kCompressorMinimumActivePercent
+        ? CompressorControlState{0, true, clampCompressorPercent(state.resume_percent)}
+        : CompressorControlState{clampCompressorPercent(state.actual_percent), false, 0};
+    compressor_write_pending_ = true;
+    ++compressor_revision_;
     portEXIT_CRITICAL(&session_mux_);
 }
 
@@ -143,7 +190,74 @@ bool HypurpleControllerClient::connected() const
     return fresh;
 }
 
-bool HypurpleControllerClient::fetchPumpState(uint32_t request_revision)
+bool HypurpleControllerClient::fetchScreenConfiguration()
+{
+    HTTPClient http;
+    http.setTimeout(kHttpTimeoutMs);
+    if (!http.begin(endpoint("/smart-knob/screens"))) {
+        return false;
+    }
+    http.addHeader("X-Hypurple-HMI-Token", kControllerToken);
+    const int status_code = http.GET();
+    const String payload = status_code == HTTP_CODE_OK ? http.getString() : String();
+    http.end();
+    if (status_code != HTTP_CODE_OK) {
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(payload.c_str());
+    const cJSON *schema_version = root == nullptr
+        ? nullptr
+        : cJSON_GetObjectItemCaseSensitive(root, "schemaVersion");
+    const cJSON *screens = root == nullptr
+        ? nullptr
+        : cJSON_GetObjectItemCaseSensitive(root, "screens");
+    SmartKnobScreenConfiguration configuration = {};
+    if (!cJSON_IsNumber(schema_version) || schema_version->valueint != 1 || !cJSON_IsArray(screens)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    const cJSON *screen = nullptr;
+    cJSON_ArrayForEach(screen, screens) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(screen, "id");
+        if (!cJSON_IsString(id) || configuration.count >= kSmartKnobMaxScreens) {
+            cJSON_Delete(root);
+            return false;
+        }
+        SmartKnobScreenKind kind;
+        if (strcmp(id->valuestring, "mini-pump") == 0) {
+            kind = SmartKnobScreenKind::MiniPump;
+        } else if (strcmp(id->valuestring, "hanbuild-stepper") == 0) {
+            continue;
+        } else if (strcmp(id->valuestring, "compressor-flow") == 0) {
+            kind = SmartKnobScreenKind::CompressorFlow;
+        } else {
+            cJSON_Delete(root);
+            return false;
+        }
+        for (size_t index = 0; index < configuration.count; ++index) {
+            if (configuration.screens[index] == kind) {
+                cJSON_Delete(root);
+                return false;
+            }
+        }
+        configuration.screens[configuration.count++] = kind;
+    }
+    cJSON_Delete(root);
+    if (configuration.count == 0) {
+        return false;
+    }
+
+    screen_configuration_loaded_ = true;
+    if (screen_configuration_callback_ != nullptr) {
+        screen_configuration_callback_(configuration);
+    }
+    Serial.println("Smart Knob screen configuration loaded");
+    return true;
+}
+
+bool HypurpleControllerClient::fetchControllerState(uint32_t request_revision)
 {
     HTTPClient http;
     http.setTimeout(kHttpTimeoutMs);
@@ -155,10 +269,16 @@ bool HypurpleControllerClient::fetchPumpState(uint32_t request_revision)
     http.end();
 
     PumpControlState state = resetPumpState();
-    if (status_code != HTTP_CODE_OK || !parsePumpState(payload, state)) {
+    CompressorControlState compressor_state = stoppedCompressorState();
+    if (
+        status_code != HTTP_CODE_OK ||
+        !parsePumpState(payload, state) ||
+        !parseCompressorState(payload, compressor_state)
+    ) {
         return false;
     }
     reconcileResponse(state, request_revision);
+    if (compressor_callback_ != nullptr) compressor_callback_(compressor_state);
     return true;
 }
 
@@ -184,10 +304,16 @@ bool HypurpleControllerClient::sendPumpState(
     http.end();
 
     PumpControlState state = resetPumpState();
-    if (status_code != HTTP_CODE_OK || !parsePumpState(response, state)) {
+    CompressorControlState compressor_state = stoppedCompressorState();
+    if (
+        status_code != HTTP_CODE_OK ||
+        !parsePumpState(response, state) ||
+        !parseCompressorState(response, compressor_state)
+    ) {
         return false;
     }
     reconcileResponse(state, request_revision);
+    if (compressor_callback_ != nullptr) compressor_callback_(compressor_state);
     return true;
 }
 
@@ -210,10 +336,50 @@ bool HypurpleControllerClient::sendPumpHeartbeat(uint32_t request_revision)
     http.end();
 
     PumpControlState state = resetPumpState();
-    if (status_code != HTTP_CODE_OK || !parsePumpState(response, state)) {
+    CompressorControlState compressor_state = stoppedCompressorState();
+    if (
+        status_code != HTTP_CODE_OK ||
+        !parsePumpState(response, state) ||
+        !parseCompressorState(response, compressor_state)
+    ) {
         return false;
     }
     reconcileResponse(state, request_revision);
+    if (compressor_callback_ != nullptr) compressor_callback_(compressor_state);
+    return true;
+}
+
+bool HypurpleControllerClient::sendCompressorState(
+    CompressorControlState requested_state,
+    uint32_t request_revision)
+{
+    HTTPClient http;
+    http.setTimeout(kHttpTimeoutMs);
+    if (!http.begin(endpoint("/skr-pico/command"))) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Hypurple-HMI-Token", kControllerToken);
+    const String payload = String("{\"action\":\"skr.compressor.set_output\",") +
+        "\"componentId\":\"" + kComponentId + "\"," +
+        "\"deviceId\":\"" + kDeviceId + "\"," +
+        "\"parameters\":{\"outputPercent\":" +
+        String(requested_state.actual_percent) +
+        ",\"paused\":" + (requested_state.paused ? "true" : "false") +
+        ",\"resumeOutputPercent\":" + String(requested_state.resume_percent) + "}}";
+    const int status_code = http.POST(payload);
+    const String response = status_code == HTTP_CODE_OK ? http.getString() : String();
+    http.end();
+
+    CompressorControlState confirmed = stoppedCompressorState();
+    if (status_code != HTTP_CODE_OK || !parseCompressorState(response, confirmed)) return false;
+    portENTER_CRITICAL(&session_mux_);
+    if (compressor_revision_ == request_revision) {
+        compressor_state_ = confirmed;
+        compressor_write_pending_ = false;
+    }
+    failure_reported_ = false;
+    last_success_at_ = millis();
+    portEXIT_CRITICAL(&session_mux_);
+    if (compressor_callback_ != nullptr) compressor_callback_(confirmed);
     return true;
 }
 
@@ -272,10 +438,55 @@ bool HypurpleControllerClient::parsePumpState(const String &payload, PumpControl
     return true;
 }
 
+bool HypurpleControllerClient::parseCompressorState(
+    const String &payload,
+    CompressorControlState &state) const
+{
+    cJSON *root = cJSON_Parse(payload.c_str());
+    if (root == nullptr) return false;
+    const cJSON *control = cJSON_GetObjectItemCaseSensitive(root, "compressorControl");
+    const cJSON *actual = cJSON_IsObject(control)
+        ? cJSON_GetObjectItemCaseSensitive(control, "actualOutputPercent")
+        : nullptr;
+    const cJSON *paused = cJSON_IsObject(control)
+        ? cJSON_GetObjectItemCaseSensitive(control, "paused")
+        : nullptr;
+    const cJSON *resume = cJSON_IsObject(control)
+        ? cJSON_GetObjectItemCaseSensitive(control, "resumeOutputPercent")
+        : nullptr;
+    if (
+        !cJSON_IsNumber(actual) || actual->valueint < 0 || actual->valueint > 100 ||
+        !cJSON_IsBool(paused) ||
+        !cJSON_IsNumber(resume) || resume->valueint < 0 || resume->valueint > 100
+    ) {
+        cJSON_Delete(root);
+        return false;
+    }
+    const bool is_paused = cJSON_IsTrue(paused) != 0;
+    if (
+        (is_paused && (actual->valueint != 0 || resume->valueint < kCompressorMinimumActivePercent)) ||
+        (!is_paused && resume->valueint != 0)
+    ) {
+        cJSON_Delete(root);
+        return false;
+    }
+    state = {
+        clampCompressorPercent(actual->valueint),
+        is_paused,
+        clampCompressorPercent(resume->valueint),
+    };
+    cJSON_Delete(root);
+    return true;
+}
+
 void HypurpleControllerClient::handleCommunicationFailure()
 {
     portENTER_CRITICAL(&session_mux_);
     session_ = markPumpControllerOffline(session_);
+    compressor_state_ = stoppedCompressorState();
+    compressor_write_pending_ = false;
+    ++compressor_revision_;
+    screen_configuration_loaded_ = false;
     if (failure_reported_) {
         portEXIT_CRITICAL(&session_mux_);
         return;
@@ -285,6 +496,9 @@ void HypurpleControllerClient::handleCommunicationFailure()
     portEXIT_CRITICAL(&session_mux_);
     if (callback_ != nullptr) {
         callback_(offline_state);
+    }
+    if (compressor_callback_ != nullptr) {
+        compressor_callback_(stoppedCompressorState());
     }
     Serial.println("Controller communication unavailable; pump state forced OFF");
 }
