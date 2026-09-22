@@ -57,11 +57,13 @@ const cJSON *findPumpActuator(const cJSON *root)
 void HypurpleControllerClient::begin(
     PumpStateCallback callback,
     CompressorStateCallback compressor_callback,
-    ScreenConfigurationCallback screen_configuration_callback)
+    ScreenConfigurationCallback screen_configuration_callback,
+    HanBuildSafetyStopCallback hanbuild_safety_stop_callback)
 {
     callback_ = callback;
     compressor_callback_ = compressor_callback;
     screen_configuration_callback_ = screen_configuration_callback;
+    hanbuild_safety_stop_callback_ = hanbuild_safety_stop_callback;
     if (!configured()) {
         Serial.println("Controller client disabled: configuration incomplete");
         return;
@@ -108,6 +110,37 @@ void HypurpleControllerClient::loop()
         if (!fetchScreenConfiguration()) {
             handleCommunicationFailure();
         }
+        return;
+    }
+
+    HanBuildSpeedTarget hanbuild_target;
+    bool hanbuild_write_pending;
+    uint32_t hanbuild_revision;
+    portENTER_CRITICAL(&session_mux_);
+    hanbuild_target = hanbuild_target_;
+    hanbuild_write_pending = hanbuild_write_pending_;
+    hanbuild_revision = hanbuild_revision_;
+    portEXIT_CRITICAL(&session_mux_);
+    if (
+        hanbuild_write_pending ||
+        (hanbuild_target.rpm != 0 &&
+         now - last_hanbuild_segment_at_ >= kHanBuildHeartbeatIntervalMs)
+    ) {
+        const bool success = hanbuild_write_pending
+            ? sendHanBuildSegment(hanbuild_target)
+            : sendHanBuildHeartbeat();
+        if (!success) {
+            handleCommunicationFailure();
+            return;
+        }
+        portENTER_CRITICAL(&session_mux_);
+        if (hanbuild_revision_ == hanbuild_revision) {
+            hanbuild_write_pending_ = false;
+        }
+        last_success_at_ = millis();
+        failure_reported_ = false;
+        portEXIT_CRITICAL(&session_mux_);
+        last_hanbuild_segment_at_ = millis();
         return;
     }
 
@@ -173,6 +206,20 @@ void HypurpleControllerClient::setDesiredCompressorState(
     portEXIT_CRITICAL(&session_mux_);
 }
 
+void HypurpleControllerClient::setHanBuildSpeedTarget(HanBuildSpeedTarget target)
+{
+    portENTER_CRITICAL(&session_mux_);
+    hanbuild_target_ = {clampHanBuildRpm(target.rpm)};
+    hanbuild_write_pending_ = true;
+    ++hanbuild_revision_;
+    portEXIT_CRITICAL(&session_mux_);
+}
+
+void HypurpleControllerClient::stopHanBuild()
+{
+    setHanBuildSpeedTarget(stoppedHanBuildSpeedTarget());
+}
+
 bool HypurpleControllerClient::configured() const
 {
     return kWifiSsid[0] != '\0' && kControllerUrl[0] != '\0' && kControllerToken[0] != '\0';
@@ -229,7 +276,7 @@ bool HypurpleControllerClient::fetchScreenConfiguration()
         if (strcmp(id->valuestring, "mini-pump") == 0) {
             kind = SmartKnobScreenKind::MiniPump;
         } else if (strcmp(id->valuestring, "hanbuild-stepper") == 0) {
-            continue;
+            kind = SmartKnobScreenKind::HanBuildStepper;
         } else if (strcmp(id->valuestring, "compressor-flow") == 0) {
             kind = SmartKnobScreenKind::CompressorFlow;
         } else {
@@ -383,6 +430,38 @@ bool HypurpleControllerClient::sendCompressorState(
     return true;
 }
 
+bool HypurpleControllerClient::sendHanBuildSegment(HanBuildSpeedTarget target)
+{
+    HTTPClient http;
+    http.setTimeout(kHttpTimeoutMs);
+    if (!http.begin(endpoint("/skr-pico/command"))) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Hypurple-HMI-Token", kControllerToken);
+    const String payload = String("{\"action\":\"skr.motion.set_velocity\",") +
+        "\"componentId\":\"" + kComponentId + "\"," +
+        "\"deviceId\":\"" + kDeviceId + "\"," +
+        "\"parameters\":{\"channelId\":\"mc2\",\"rpm\":" + String(target.rpm) + "}}";
+    const int status_code = http.POST(payload);
+    http.end();
+    return status_code == HTTP_CODE_OK;
+}
+
+bool HypurpleControllerClient::sendHanBuildHeartbeat()
+{
+    HTTPClient http;
+    http.setTimeout(kHttpTimeoutMs);
+    if (!http.begin(endpoint("/skr-pico/command"))) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Hypurple-HMI-Token", kControllerToken);
+    const String payload = String("{\"action\":\"skr.motion.velocity_heartbeat\",") +
+        "\"componentId\":\"" + kComponentId + "\"," +
+        "\"deviceId\":\"" + kDeviceId + "\"," +
+        "\"parameters\":{\"channelId\":\"mc2\"}}";
+    const int status_code = http.POST(payload);
+    http.end();
+    return status_code == HTTP_CODE_OK;
+}
+
 void HypurpleControllerClient::reconcileResponse(
     const PumpControlState &state,
     uint32_t request_revision)
@@ -483,6 +562,10 @@ void HypurpleControllerClient::handleCommunicationFailure()
 {
     portENTER_CRITICAL(&session_mux_);
     session_ = markPumpControllerOffline(session_);
+    const bool hanbuild_was_active = hanbuild_target_.rpm != 0;
+    hanbuild_target_ = stoppedHanBuildSpeedTarget();
+    hanbuild_write_pending_ = false;
+    ++hanbuild_revision_;
     compressor_state_ = stoppedCompressorState();
     compressor_write_pending_ = false;
     ++compressor_revision_;
@@ -499,6 +582,9 @@ void HypurpleControllerClient::handleCommunicationFailure()
     }
     if (compressor_callback_ != nullptr) {
         compressor_callback_(stoppedCompressorState());
+    }
+    if (hanbuild_was_active && hanbuild_safety_stop_callback_ != nullptr) {
+        hanbuild_safety_stop_callback_();
     }
     Serial.println("Controller communication unavailable; pump state forced OFF");
 }

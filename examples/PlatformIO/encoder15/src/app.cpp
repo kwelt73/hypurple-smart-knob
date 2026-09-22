@@ -48,6 +48,7 @@ constexpr uint32_t kCompressorTrackColor = 0xB3B2AF;
 
 enum class HmiScreen {
     Pump,
+    HanBuild,
     Compressor,
     ColorDiagnostics,
 };
@@ -67,10 +68,12 @@ SmartKnobScreenConfiguration screen_configuration = defaultSmartKnobScreenConfig
 size_t active_screen_index = 0;
 int pending_screen_index = -1;
 PumpControlState pump_state = resetPumpState();
+HanBuildSpeedTarget hanbuild_speed_target = stoppedHanBuildSpeedTarget();
 CompressorControlState compressor_state = stoppedCompressorState();
 
 lv_obj_t *welcome_screen = nullptr;
 lv_obj_t *pump_screen = nullptr;
+lv_obj_t *hanbuild_screen = nullptr;
 lv_obj_t *color_test_screen = nullptr;
 lv_obj_t *pump_arc = nullptr;
 lv_obj_t *pump_value_label = nullptr;
@@ -79,6 +82,11 @@ lv_obj_t *pump_pause_label = nullptr;
 lv_obj_t *pump_zero_marker = nullptr;
 lv_obj_t *pump_connection_dot = nullptr;
 lv_obj_t *pump_offline_label = nullptr;
+lv_obj_t *hanbuild_reverse_arc = nullptr;
+lv_obj_t *hanbuild_forward_arc = nullptr;
+lv_obj_t *hanbuild_value_label = nullptr;
+lv_obj_t *hanbuild_unit_label = nullptr;
+lv_obj_t *hanbuild_direction_label = nullptr;
 lv_obj_t *compressor_screen = nullptr;
 lv_obj_t *compressor_arc = nullptr;
 lv_obj_t *compressor_value_label = nullptr;
@@ -258,6 +266,110 @@ void createPumpScreen()
     lv_obj_add_event_cb(pump_screen, handleScreenGesture, LV_EVENT_GESTURE, nullptr);
     for (uint32_t index = 0; index < lv_obj_get_child_cnt(pump_screen); ++index) {
         lv_obj_add_flag(lv_obj_get_child(pump_screen, index), LV_OBJ_FLAG_EVENT_BUBBLE);
+    }
+}
+
+void updateHanBuildScreen()
+{
+    const int rpm = hanbuild_speed_target.rpm < 0
+        ? -hanbuild_speed_target.rpm
+        : hanbuild_speed_target.rpm;
+    lv_label_set_text_fmt(hanbuild_value_label, "%d", rpm);
+    lv_label_set_text(hanbuild_unit_label, "RPM");
+    lv_arc_set_value(
+        hanbuild_reverse_arc,
+        hanbuild_speed_target.rpm < 0 ? -hanbuild_speed_target.rpm : 0);
+    lv_arc_set_value(
+        hanbuild_forward_arc,
+        hanbuild_speed_target.rpm > 0 ? hanbuild_speed_target.rpm : 0);
+    lv_obj_align(hanbuild_value_label, LV_ALIGN_CENTER, -24, 0);
+    lv_obj_align_to(hanbuild_unit_label, hanbuild_value_label, LV_ALIGN_OUT_RIGHT_MID, 5, 18);
+    lv_label_set_text(
+        hanbuild_direction_label,
+        hanBuildDirection(hanbuild_speed_target) == HanBuildDirection::Forward
+            ? "FORWARD"
+            : hanBuildDirection(hanbuild_speed_target) == HanBuildDirection::Reverse ? "REVERSE" : "STOP");
+}
+
+void stopHanBuild()
+{
+    hanbuild_speed_target = stoppedHanBuildSpeedTarget();
+    updateHanBuildScreen();
+    controller_client.stopHanBuild();
+}
+
+void createHanBuildScreen()
+{
+    hanbuild_screen = lv_obj_create(nullptr);
+    configureScreen(hanbuild_screen, kPumpStyle.background_color);
+
+    hanbuild_reverse_arc = lv_arc_create(hanbuild_screen);
+    hanbuild_forward_arc = lv_arc_create(hanbuild_screen);
+    for (lv_obj_t *arc : {hanbuild_reverse_arc, hanbuild_forward_arc}) {
+        lv_obj_set_size(arc, kPumpStyle.ring_diameter, kPumpStyle.ring_diameter);
+        lv_obj_center(arc);
+        lv_arc_set_bg_angles(arc, 0, 90);
+        lv_arc_set_range(arc, 0, kHanBuildMaximumTestRpm);
+        lv_obj_remove_style(arc, nullptr, LV_PART_KNOB);
+        lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_arc_width(arc, kPumpStyle.ring_width, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(arc, lv_color_hex(kPumpStyle.track_color), LV_PART_MAIN);
+        lv_obj_set_style_arc_width(arc, kPumpStyle.ring_width, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(arc, lv_color_hex(kPumpStyle.accent_color), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    }
+    lv_arc_set_rotation(hanbuild_reverse_arc, 180);
+    lv_arc_set_mode(hanbuild_reverse_arc, LV_ARC_MODE_REVERSE);
+    lv_arc_set_rotation(hanbuild_forward_arc, 270);
+
+    lv_obj_t *zero_marker = lv_obj_create(hanbuild_screen);
+    lv_obj_set_size(zero_marker, 3, 18);
+    lv_obj_set_style_radius(zero_marker, 2, 0);
+    lv_obj_set_style_bg_color(zero_marker, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_bg_opa(zero_marker, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(zero_marker, 0, 0);
+    lv_obj_set_style_pad_all(zero_marker, 0, 0);
+    lv_obj_clear_flag(zero_marker, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(zero_marker, LV_ALIGN_TOP_MID, 0, 31);
+
+    lv_obj_t *reverse_marker = lv_label_create(hanbuild_screen);
+    lv_label_set_text(reverse_marker, "<");
+    lv_obj_set_style_text_color(reverse_marker, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(reverse_marker, &hypurple_geist_semibold_20, 0);
+    lv_obj_align(reverse_marker, LV_ALIGN_CENTER, -178, 0);
+
+    lv_obj_t *forward_marker = lv_label_create(hanbuild_screen);
+    lv_label_set_text(forward_marker, ">");
+    lv_obj_set_style_text_color(forward_marker, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(forward_marker, &hypurple_geist_semibold_20, 0);
+    lv_obj_align(forward_marker, LV_ALIGN_CENTER, 178, 0);
+
+    lv_obj_t *title = lv_label_create(hanbuild_screen);
+    lv_label_set_text(title, "HANBUILD");
+    lv_obj_set_style_text_color(title, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(title, kPumpStyle.label_font, 0);
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -69);
+
+    hanbuild_value_label = lv_label_create(hanbuild_screen);
+    lv_obj_set_style_text_color(hanbuild_value_label, lv_color_hex(kPumpStyle.primary_text_color), 0);
+    lv_obj_set_style_text_font(hanbuild_value_label, kPumpStyle.value_font, 0);
+
+    hanbuild_unit_label = lv_label_create(hanbuild_screen);
+    lv_obj_set_style_text_color(hanbuild_unit_label, lv_color_hex(kPumpStyle.secondary_text_color), 0);
+    lv_obj_set_style_text_font(hanbuild_unit_label, &hypurple_geist_semibold_20, 0);
+
+    hanbuild_direction_label = lv_label_create(hanbuild_screen);
+    lv_obj_set_style_text_color(hanbuild_direction_label, lv_color_hex(kPumpStyle.accent_color), 0);
+    lv_obj_set_style_text_font(hanbuild_direction_label, &hypurple_geist_semibold_20, 0);
+    lv_obj_set_style_text_letter_space(hanbuild_direction_label, 2, 0);
+    lv_obj_align(hanbuild_direction_label, LV_ALIGN_CENTER, 0, 75);
+
+    updateHanBuildScreen();
+    lv_obj_add_event_cb(hanbuild_screen, handleScreenGesture, LV_EVENT_GESTURE, nullptr);
+    for (uint32_t index = 0; index < lv_obj_get_child_cnt(hanbuild_screen); ++index) {
+        lv_obj_add_flag(lv_obj_get_child(hanbuild_screen, index), LV_OBJ_FLAG_EVENT_BUBBLE);
     }
 }
 
@@ -490,6 +602,8 @@ HmiScreen toHmiScreen(SmartKnobScreenKind kind)
     switch (kind) {
         case SmartKnobScreenKind::MiniPump:
             return HmiScreen::Pump;
+        case SmartKnobScreenKind::HanBuildStepper:
+            return HmiScreen::HanBuild;
         case SmartKnobScreenKind::CompressorFlow:
             return HmiScreen::Compressor;
     }
@@ -501,6 +615,8 @@ lv_obj_t *screenObject(HmiScreen screen)
     switch (screen) {
         case HmiScreen::Pump:
             return pump_screen;
+        case HmiScreen::HanBuild:
+            return hanbuild_screen;
         case HmiScreen::Compressor:
             return compressor_screen;
         case HmiScreen::ColorDiagnostics:
@@ -514,6 +630,7 @@ void showConfiguredScreen(size_t index)
     if (screen_configuration.count == 0 || index >= screen_configuration.count) return;
     active_screen_index = index;
     active_screen = toHmiScreen(screen_configuration.screens[index]);
+    if (active_screen == HmiScreen::HanBuild) stopHanBuild();
     lv_scr_load(screenObject(active_screen));
     hmi_phase = HmiPhase::Interactive;
     Serial.printf("Smart Knob screen: %s\n", smartKnobScreenId(screen_configuration.screens[index]));
@@ -540,6 +657,9 @@ void requestConfiguredScreen(size_t index)
         controller_client.setDesiredCompressorState(compressor_state);
         Serial.println("Screen change waiting for Compressor OFF confirmation");
         return;
+    }
+    if (active_screen == HmiScreen::HanBuild) {
+        stopHanBuild();
     }
     showConfiguredScreen(index);
 }
@@ -604,6 +724,28 @@ void adjustActiveValue(int delta)
             compressor_state.actual_percent,
             compressor_state.paused ? "true" : "false",
             compressor_state.resume_percent);
+        return;
+    }
+
+    if (active_screen == HmiScreen::HanBuild) {
+        const HanBuildSpeedTarget next_target =
+            applyHanBuildSpeedDelta(hanbuild_speed_target, delta);
+        if (next_target.rpm == hanbuild_speed_target.rpm) {
+            lvgl_port_unlock();
+            return;
+        }
+        hanbuild_speed_target = next_target;
+        updateHanBuildScreen();
+        lvgl_port_unlock();
+        controller_client.setHanBuildSpeedTarget(hanbuild_speed_target);
+        Serial.printf(
+            "HanBuild target %s %.1f RPM\n",
+            hanBuildDirection(hanbuild_speed_target) == HanBuildDirection::Forward
+                ? "FORWARD"
+                : hanBuildDirection(hanbuild_speed_target) == HanBuildDirection::Reverse
+                    ? "REVERSE"
+                    : "STOP",
+            hanBuildRpm(hanbuild_speed_target));
         return;
     }
 
@@ -684,6 +826,7 @@ void applyScreenConfiguration(const SmartKnobScreenConfiguration &configuration)
     lvgl_port_lock(-1);
     const HmiScreen previous_screen = active_screen;
     screen_configuration = configuration;
+    if (previous_screen == HmiScreen::HanBuild) stopHanBuild();
     size_t matching_index = configuration.count;
     for (size_t index = 0; index < configuration.count; ++index) {
         if (toHmiScreen(configuration.screens[index]) == previous_screen) {
@@ -741,6 +884,13 @@ void onSingleClick(void *button_handle, void *user_data)
         return;
     }
 
+    if (active_screen == HmiScreen::HanBuild) {
+        stopHanBuild();
+        lvgl_port_unlock();
+        Serial.println("HanBuild stopped");
+        return;
+    }
+
     if (active_screen == HmiScreen::Compressor) {
         const CompressorControlState requested_state = toggleCompressorPause(compressor_state);
         lvgl_port_unlock();
@@ -780,6 +930,12 @@ void onLongPressStart(void *button_handle, void *user_data)
     lvgl_port_lock(-1);
     if (hmi_phase != HmiPhase::Interactive) {
         lvgl_port_unlock();
+        return;
+    }
+    if (active_screen == HmiScreen::HanBuild) {
+        stopHanBuild();
+        lvgl_port_unlock();
+        Serial.println("HanBuild reset");
         return;
     }
     if (active_screen == HmiScreen::Compressor) {
@@ -839,6 +995,7 @@ void setup()
     lvgl_port_lock(-1);
     createWelcomeScreen();
     createPumpScreen();
+    createHanBuildScreen();
     createCompressorScreen();
     createColorTestScreen();
     lv_scr_load(welcome_screen);
@@ -849,7 +1006,14 @@ void setup()
     controller_client.begin(
         applyControllerPumpState,
         applyControllerCompressorState,
-        applyScreenConfiguration);
+        applyScreenConfiguration,
+        []() {
+        lvgl_port_lock(-1);
+        hanbuild_speed_target = stoppedHanBuildSpeedTarget();
+        updateHanBuildScreen();
+        lvgl_port_unlock();
+        Serial.println("HanBuild fail-safe STOP");
+    });
 
     Serial.println("Welcome screen");
 }

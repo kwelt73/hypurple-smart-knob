@@ -5,6 +5,7 @@
 
 enum class SmartKnobScreenKind : uint8_t {
     MiniPump,
+    HanBuildStepper,
     CompressorFlow,
 };
 
@@ -19,8 +20,9 @@ constexpr SmartKnobScreenConfiguration defaultSmartKnobScreenConfiguration()
 {
     return {{
         SmartKnobScreenKind::MiniPump,
+        SmartKnobScreenKind::HanBuildStepper,
         SmartKnobScreenKind::CompressorFlow,
-    }, 2};
+    }, 3};
 }
 
 constexpr uint8_t kCompressorMinimumActivePercent = 5;
@@ -104,6 +106,70 @@ constexpr CompressorControlState toggleCompressorPause(CompressorControlState pr
     return {kCompressorMinimumActivePercent, false, 0};
 }
 
+constexpr int16_t kHanBuildMinimumRunningRpm = 30;
+constexpr int16_t kHanBuildDefaultTestRpm = 60;
+constexpr int16_t kHanBuildMaximumTestRpm = 180;
+constexpr float kHanBuildAcceleration = 20.0F;
+constexpr uint16_t kHanBuildSegmentDurationMs = 250;
+constexpr uint16_t kHanBuildHeartbeatIntervalMs = 100;
+constexpr float kHanBuildRotationDistance = 40.0F;
+
+enum class HanBuildDirection : int8_t {
+    Reverse = -1,
+    Stop = 0,
+    Forward = 1,
+};
+
+struct HanBuildSpeedTarget {
+    int16_t rpm;
+};
+
+constexpr HanBuildSpeedTarget stoppedHanBuildSpeedTarget()
+{
+    return {0};
+}
+
+constexpr int16_t clampHanBuildRpm(int value)
+{
+    if (value == 0 || (value > -kHanBuildMinimumRunningRpm && value < kHanBuildMinimumRunningRpm)) {
+        return 0;
+    }
+    return value < -kHanBuildMaximumTestRpm
+        ? -kHanBuildMaximumTestRpm
+        : value > kHanBuildMaximumTestRpm ? kHanBuildMaximumTestRpm : static_cast<int16_t>(value);
+}
+
+constexpr HanBuildSpeedTarget applyHanBuildSpeedDelta(HanBuildSpeedTarget previous, int delta)
+{
+    if (delta == 0) return previous;
+    if (previous.rpm == 0) {
+        const int magnitude = kHanBuildMinimumRunningRpm + (delta > 0 ? delta - 1 : -delta - 1);
+        return {clampHanBuildRpm(delta > 0 ? magnitude : -magnitude)};
+    }
+    const int proposed = static_cast<int>(previous.rpm) + delta;
+    if ((previous.rpm > 0 && proposed <= 0) || (previous.rpm < 0 && proposed >= 0)) return {0};
+    if (proposed > -kHanBuildMinimumRunningRpm && proposed < kHanBuildMinimumRunningRpm) return {0};
+    return {clampHanBuildRpm(proposed)};
+}
+
+constexpr HanBuildDirection hanBuildDirection(HanBuildSpeedTarget target)
+{
+    return target.rpm > 0
+        ? HanBuildDirection::Forward
+        : target.rpm < 0 ? HanBuildDirection::Reverse : HanBuildDirection::Stop;
+}
+
+constexpr float hanBuildSpeed(HanBuildSpeedTarget target)
+{
+    const int magnitude = target.rpm < 0 ? -target.rpm : target.rpm;
+    return static_cast<float>(magnitude) / 60.0F * kHanBuildRotationDistance;
+}
+
+constexpr float hanBuildRpm(HanBuildSpeedTarget target)
+{
+    return static_cast<float>(target.rpm < 0 ? -target.rpm : target.rpm);
+}
+
 constexpr size_t resolveBoundedScreenIndex(size_t current, int direction, size_t count)
 {
     if (count == 0 || direction == 0) return current;
@@ -116,12 +182,23 @@ constexpr const char *smartKnobScreenId(SmartKnobScreenKind kind)
     switch (kind) {
         case SmartKnobScreenKind::MiniPump:
             return "mini-pump";
+        case SmartKnobScreenKind::HanBuildStepper:
+            return "hanbuild-stepper";
         case SmartKnobScreenKind::CompressorFlow:
             return "compressor-flow";
     }
     return "mini-pump";
 }
 
+static_assert(applyHanBuildSpeedDelta({0}, 1).rpm == 30);
+static_assert(applyHanBuildSpeedDelta({0}, -1).rpm == -30);
+static_assert(applyHanBuildSpeedDelta({30}, 1).rpm == 31);
+static_assert(applyHanBuildSpeedDelta({30}, -1).rpm == 0);
+static_assert(applyHanBuildSpeedDelta({-30}, 1).rpm == 0);
+static_assert(applyHanBuildSpeedDelta({180}, 1).rpm == 180);
+static_assert(applyHanBuildSpeedDelta({-180}, -1).rpm == -180);
+static_assert(hanBuildSpeed({60}) == 40.0F);
+static_assert(hanBuildRpm({-137}) == 137.0F);
 static_assert(resolveBoundedScreenIndex(0, -1, 2) == 0);
 static_assert(resolveBoundedScreenIndex(0, 1, 2) == 1);
 static_assert(resolveBoundedScreenIndex(1, 1, 2) == 1);
