@@ -124,9 +124,28 @@ struct HanBuildSpeedTarget {
     int16_t rpm;
 };
 
+struct HanBuildRuntimeState {
+    HanBuildSpeedTarget target;
+    float commanded_rpm;
+    bool moving;
+};
+
+struct HanBuildControllerSession {
+    HanBuildRuntimeState state;
+    bool dirty;
+    bool read_before_write;
+    bool connected;
+    uint32_t revision;
+};
+
 constexpr HanBuildSpeedTarget stoppedHanBuildSpeedTarget()
 {
     return {0};
+}
+
+constexpr HanBuildRuntimeState stoppedHanBuildRuntimeState()
+{
+    return {stoppedHanBuildSpeedTarget(), 0.0F, false};
 }
 
 constexpr int16_t clampHanBuildRpm(int value)
@@ -168,6 +187,57 @@ constexpr float hanBuildSpeed(HanBuildSpeedTarget target)
 constexpr float hanBuildRpm(HanBuildSpeedTarget target)
 {
     return static_cast<float>(target.rpm < 0 ? -target.rpm : target.rpm);
+}
+
+constexpr HanBuildControllerSession beginHanBuildControllerSession()
+{
+    return {stoppedHanBuildRuntimeState(), false, true, false, 0};
+}
+
+constexpr HanBuildControllerSession applyHanBuildUserInteraction(
+    HanBuildControllerSession session,
+    HanBuildSpeedTarget target)
+{
+    if (!session.connected || session.read_before_write) return session;
+    session.state.target = {clampHanBuildRpm(target.rpm)};
+    session.dirty = true;
+    ++session.revision;
+    return session;
+}
+
+constexpr HanBuildControllerSession markHanBuildControllerOffline(
+    HanBuildControllerSession session)
+{
+    session.state = stoppedHanBuildRuntimeState();
+    session.dirty = false;
+    session.read_before_write = true;
+    session.connected = false;
+    ++session.revision;
+    return session;
+}
+
+constexpr HanBuildControllerSession reconcileHanBuildControllerResponse(
+    HanBuildControllerSession session,
+    HanBuildRuntimeState authoritative_state,
+    uint32_t request_revision,
+    bool allow_authoritative_update = true)
+{
+    session.connected = true;
+    session.read_before_write = false;
+    if (session.revision == request_revision && allow_authoritative_update) {
+        session.state = authoritative_state;
+        session.state.target = {clampHanBuildRpm(authoritative_state.target.rpm)};
+        session.dirty = false;
+    }
+    return session;
+}
+
+constexpr HanBuildControllerSession acknowledgeHanBuildCommand(
+    HanBuildControllerSession session,
+    uint32_t request_revision)
+{
+    if (session.revision == request_revision) session.dirty = false;
+    return session;
 }
 
 constexpr size_t resolveBoundedScreenIndex(size_t current, int direction, size_t count)

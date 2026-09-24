@@ -821,6 +821,14 @@ void applyControllerCompressorState(const CompressorControlState &state)
     lvgl_port_unlock();
 }
 
+void applyControllerHanBuildState(const HanBuildRuntimeState &state)
+{
+    lvgl_port_lock(-1);
+    hanbuild_speed_target = state.target;
+    updateHanBuildScreen();
+    lvgl_port_unlock();
+}
+
 void applyScreenConfiguration(const SmartKnobScreenConfiguration &configuration)
 {
     lvgl_port_lock(-1);
@@ -1006,6 +1014,7 @@ void setup()
     controller_client.begin(
         applyControllerPumpState,
         applyControllerCompressorState,
+        applyControllerHanBuildState,
         applyScreenConfiguration,
         []() {
         lvgl_port_lock(-1);

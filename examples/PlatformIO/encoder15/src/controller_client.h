@@ -7,6 +7,7 @@
 
 using PumpStateCallback = void (*)(const PumpControlState &state);
 using CompressorStateCallback = void (*)(const CompressorControlState &state);
+using HanBuildStateCallback = void (*)(const HanBuildRuntimeState &state);
 using ScreenConfigurationCallback = void (*)(const SmartKnobScreenConfiguration &configuration);
 using HanBuildSafetyStopCallback = void (*)();
 
@@ -15,6 +16,7 @@ public:
     void begin(
         PumpStateCallback callback,
         CompressorStateCallback compressor_callback,
+        HanBuildStateCallback hanbuild_callback,
         ScreenConfigurationCallback screen_configuration_callback,
         HanBuildSafetyStopCallback hanbuild_safety_stop_callback);
     void loop();
@@ -32,17 +34,23 @@ private:
     bool sendPumpState(PumpControlState requested_state, uint32_t request_revision);
     bool sendPumpHeartbeat(uint32_t request_revision);
     bool sendCompressorState(CompressorControlState requested_state, uint32_t request_revision);
-    bool sendHanBuildSegment(HanBuildSpeedTarget target);
+    bool sendHanBuildSegment(HanBuildSpeedTarget target, uint32_t request_revision);
     bool sendHanBuildHeartbeat();
     bool parsePumpState(const String &payload, PumpControlState &state) const;
     bool parseCompressorState(const String &payload, CompressorControlState &state) const;
+    bool parseHanBuildState(const String &payload, HanBuildRuntimeState &state) const;
     void reconcileResponse(const PumpControlState &state, uint32_t request_revision);
+    void reconcileHanBuildResponse(
+        const HanBuildRuntimeState &state,
+        uint32_t request_revision,
+        bool allow_authoritative_update);
     void handleCommunicationFailure();
     PumpControllerSession snapshotSession() const;
     String endpoint(const char *path) const;
 
     PumpStateCallback callback_ = nullptr;
     CompressorStateCallback compressor_callback_ = nullptr;
+    HanBuildStateCallback hanbuild_callback_ = nullptr;
     ScreenConfigurationCallback screen_configuration_callback_ = nullptr;
     HanBuildSafetyStopCallback hanbuild_safety_stop_callback_ = nullptr;
     PumpControllerSession session_ = beginPumpControllerSession();
@@ -51,11 +59,10 @@ private:
     uint32_t last_success_at_ = 0;
     uint32_t last_request_at_ = 0;
     uint32_t last_hanbuild_segment_at_ = 0;
+    uint32_t last_hanbuild_interaction_at_ = 0;
     uint32_t last_compressor_request_at_ = 0;
     uint32_t last_wifi_attempt_at_ = 0;
-    HanBuildSpeedTarget hanbuild_target_ = stoppedHanBuildSpeedTarget();
-    bool hanbuild_write_pending_ = false;
-    uint32_t hanbuild_revision_ = 0;
+    HanBuildControllerSession hanbuild_session_ = beginHanBuildControllerSession();
     CompressorControlState compressor_state_ = stoppedCompressorState();
     bool compressor_write_pending_ = false;
     uint32_t compressor_revision_ = 0;

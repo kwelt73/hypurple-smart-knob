@@ -1,5 +1,7 @@
 #include "controller_client.h"
 
+#include <cmath>
+
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <cJSON.h>
@@ -24,12 +26,14 @@ namespace {
 
 constexpr uint32_t kRequestIntervalMs = 1000;
 constexpr uint32_t kCompressorCommandIntervalMs = 200;
+constexpr uint32_t kHanBuildLocalInteractionQuietMs = 400;
 constexpr uint32_t kWifiRetryIntervalMs = 30000;
 constexpr uint32_t kControllerStateStaleAfterMs = 3500;
 constexpr uint16_t kHttpTimeoutMs = 750;
 
 constexpr char kDeviceId[] = "DG-0001";
 constexpr char kComponentId[] = "bigtreetech-skr-pico-v1";
+constexpr char kSmartKnobDeviceId[] = "viewe-uedx46460015-md50et";
 constexpr char kWifiSsid[] = HYPURPLE_WIFI_SSID;
 constexpr char kWifiPassword[] = HYPURPLE_WIFI_PASSWORD;
 constexpr char kControllerUrl[] = HYPURPLE_CONTROLLER_URL;
@@ -52,16 +56,30 @@ const cJSON *findPumpActuator(const cJSON *root)
     return nullptr;
 }
 
+const cJSON *findMotionChannel(const cJSON *root, const char *channel_id)
+{
+    const cJSON *channels = cJSON_GetObjectItemCaseSensitive(root, "motionChannels");
+    if (!cJSON_IsArray(channels)) return nullptr;
+    const cJSON *channel = nullptr;
+    cJSON_ArrayForEach(channel, channels) {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(channel, "id");
+        if (cJSON_IsString(id) && strcmp(id->valuestring, channel_id) == 0) return channel;
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 void HypurpleControllerClient::begin(
     PumpStateCallback callback,
     CompressorStateCallback compressor_callback,
+    HanBuildStateCallback hanbuild_callback,
     ScreenConfigurationCallback screen_configuration_callback,
     HanBuildSafetyStopCallback hanbuild_safety_stop_callback)
 {
     callback_ = callback;
     compressor_callback_ = compressor_callback;
+    hanbuild_callback_ = hanbuild_callback;
     screen_configuration_callback_ = screen_configuration_callback;
     hanbuild_safety_stop_callback_ = hanbuild_safety_stop_callback;
     if (!configured()) {
@@ -113,33 +131,22 @@ void HypurpleControllerClient::loop()
         return;
     }
 
-    HanBuildSpeedTarget hanbuild_target;
-    bool hanbuild_write_pending;
-    uint32_t hanbuild_revision;
+    HanBuildControllerSession hanbuild_session;
     portENTER_CRITICAL(&session_mux_);
-    hanbuild_target = hanbuild_target_;
-    hanbuild_write_pending = hanbuild_write_pending_;
-    hanbuild_revision = hanbuild_revision_;
+    hanbuild_session = hanbuild_session_;
     portEXIT_CRITICAL(&session_mux_);
     if (
-        hanbuild_write_pending ||
-        (hanbuild_target.rpm != 0 &&
+        hanbuild_session.dirty ||
+        (!hanbuild_session.read_before_write && hanbuild_session.state.target.rpm != 0 &&
          now - last_hanbuild_segment_at_ >= kHanBuildHeartbeatIntervalMs)
     ) {
-        const bool success = hanbuild_write_pending
-            ? sendHanBuildSegment(hanbuild_target)
+        const bool success = hanbuild_session.dirty
+            ? sendHanBuildSegment(hanbuild_session.state.target, hanbuild_session.revision)
             : sendHanBuildHeartbeat();
         if (!success) {
             handleCommunicationFailure();
             return;
         }
-        portENTER_CRITICAL(&session_mux_);
-        if (hanbuild_revision_ == hanbuild_revision) {
-            hanbuild_write_pending_ = false;
-        }
-        last_success_at_ = millis();
-        failure_reported_ = false;
-        portEXIT_CRITICAL(&session_mux_);
         last_hanbuild_segment_at_ = millis();
         return;
     }
@@ -209,9 +216,8 @@ void HypurpleControllerClient::setDesiredCompressorState(
 void HypurpleControllerClient::setHanBuildSpeedTarget(HanBuildSpeedTarget target)
 {
     portENTER_CRITICAL(&session_mux_);
-    hanbuild_target_ = {clampHanBuildRpm(target.rpm)};
-    hanbuild_write_pending_ = true;
-    ++hanbuild_revision_;
+    hanbuild_session_ = applyHanBuildUserInteraction(hanbuild_session_, target);
+    if (hanbuild_session_.dirty) last_hanbuild_interaction_at_ = millis();
     portEXIT_CRITICAL(&session_mux_);
 }
 
@@ -306,26 +312,42 @@ bool HypurpleControllerClient::fetchScreenConfiguration()
 
 bool HypurpleControllerClient::fetchControllerState(uint32_t request_revision)
 {
+    uint32_t hanbuild_revision;
+    bool allow_hanbuild_update;
+    portENTER_CRITICAL(&session_mux_);
+    hanbuild_revision = hanbuild_session_.revision;
+    allow_hanbuild_update = !hanbuild_session_.dirty &&
+        millis() - last_hanbuild_interaction_at_ >= kHanBuildLocalInteractionQuietMs;
+    portEXIT_CRITICAL(&session_mux_);
+
     HTTPClient http;
     http.setTimeout(kHttpTimeoutMs);
     if (!http.begin(endpoint("/skr-pico/status"))) {
         return false;
     }
+    http.addHeader("X-Hypurple-Device-Id", kSmartKnobDeviceId);
+    http.addHeader("X-Hypurple-HMI-Token", kControllerToken);
     const int status_code = http.GET();
     const String payload = status_code == HTTP_CODE_OK ? http.getString() : String();
     http.end();
 
     PumpControlState state = resetPumpState();
     CompressorControlState compressor_state = stoppedCompressorState();
+    HanBuildRuntimeState hanbuild_state = stoppedHanBuildRuntimeState();
     if (
         status_code != HTTP_CODE_OK ||
         !parsePumpState(payload, state) ||
-        !parseCompressorState(payload, compressor_state)
+        !parseCompressorState(payload, compressor_state) ||
+        !parseHanBuildState(payload, hanbuild_state)
     ) {
         return false;
     }
     reconcileResponse(state, request_revision);
     if (compressor_callback_ != nullptr) compressor_callback_(compressor_state);
+    reconcileHanBuildResponse(
+        hanbuild_state,
+        hanbuild_revision,
+        allow_hanbuild_update);
     return true;
 }
 
@@ -430,7 +452,9 @@ bool HypurpleControllerClient::sendCompressorState(
     return true;
 }
 
-bool HypurpleControllerClient::sendHanBuildSegment(HanBuildSpeedTarget target)
+bool HypurpleControllerClient::sendHanBuildSegment(
+    HanBuildSpeedTarget target,
+    uint32_t request_revision)
 {
     HTTPClient http;
     http.setTimeout(kHttpTimeoutMs);
@@ -443,7 +467,13 @@ bool HypurpleControllerClient::sendHanBuildSegment(HanBuildSpeedTarget target)
         "\"parameters\":{\"channelId\":\"mc2\",\"rpm\":" + String(target.rpm) + "}}";
     const int status_code = http.POST(payload);
     http.end();
-    return status_code == HTTP_CODE_OK;
+    if (status_code != HTTP_CODE_OK) return false;
+    portENTER_CRITICAL(&session_mux_);
+    hanbuild_session_ = acknowledgeHanBuildCommand(hanbuild_session_, request_revision);
+    failure_reported_ = false;
+    last_success_at_ = millis();
+    portEXIT_CRITICAL(&session_mux_);
+    return true;
 }
 
 bool HypurpleControllerClient::sendHanBuildHeartbeat()
@@ -459,7 +489,12 @@ bool HypurpleControllerClient::sendHanBuildHeartbeat()
         "\"parameters\":{\"channelId\":\"mc2\"}}";
     const int status_code = http.POST(payload);
     http.end();
-    return status_code == HTTP_CODE_OK;
+    if (status_code != HTTP_CODE_OK) return false;
+    portENTER_CRITICAL(&session_mux_);
+    failure_reported_ = false;
+    last_success_at_ = millis();
+    portEXIT_CRITICAL(&session_mux_);
+    return true;
 }
 
 void HypurpleControllerClient::reconcileResponse(
@@ -476,6 +511,26 @@ void HypurpleControllerClient::reconcileResponse(
     portEXIT_CRITICAL(&session_mux_);
     if (callback_ != nullptr && response_is_current) {
         callback_(reconciled_state);
+    }
+}
+
+void HypurpleControllerClient::reconcileHanBuildResponse(
+    const HanBuildRuntimeState &state,
+    uint32_t request_revision,
+    bool allow_authoritative_update)
+{
+    portENTER_CRITICAL(&session_mux_);
+    const uint32_t revision_before = hanbuild_session_.revision;
+    hanbuild_session_ = reconcileHanBuildControllerResponse(
+        hanbuild_session_, state, request_revision, allow_authoritative_update);
+    failure_reported_ = false;
+    last_success_at_ = millis();
+    const HanBuildRuntimeState reconciled_state = hanbuild_session_.state;
+    const bool response_is_current =
+        revision_before == request_revision && allow_authoritative_update;
+    portEXIT_CRITICAL(&session_mux_);
+    if (hanbuild_callback_ != nullptr && response_is_current) {
+        hanbuild_callback_(reconciled_state);
     }
 }
 
@@ -558,14 +613,54 @@ bool HypurpleControllerClient::parseCompressorState(
     return true;
 }
 
+bool HypurpleControllerClient::parseHanBuildState(
+    const String &payload,
+    HanBuildRuntimeState &state) const
+{
+    cJSON *root = cJSON_Parse(payload.c_str());
+    if (root == nullptr) return false;
+    const cJSON *channel = findMotionChannel(root, "mc2");
+    const cJSON *requested = cJSON_IsObject(channel)
+        ? cJSON_GetObjectItemCaseSensitive(channel, "requestedRpm")
+        : nullptr;
+    const cJSON *commanded = cJSON_IsObject(channel)
+        ? cJSON_GetObjectItemCaseSensitive(channel, "commandedRpm")
+        : nullptr;
+    const cJSON *status = cJSON_IsObject(channel)
+        ? cJSON_GetObjectItemCaseSensitive(channel, "status")
+        : nullptr;
+    const bool requested_is_integer = cJSON_IsNumber(requested) &&
+        requested->valuedouble == static_cast<double>(requested->valueint);
+    const int requested_rpm = requested_is_integer ? requested->valueint : 0;
+    const bool requested_is_valid = requested_is_integer &&
+        clampHanBuildRpm(requested_rpm) == requested_rpm;
+    const bool commanded_is_valid = cJSON_IsNumber(commanded) &&
+        std::isfinite(commanded->valuedouble) &&
+        std::abs(commanded->valuedouble) <= kHanBuildMaximumTestRpm;
+    const bool status_is_valid = cJSON_IsString(status) && (
+        strcmp(status->valuestring, "idle") == 0 ||
+        strcmp(status->valuestring, "moving") == 0 ||
+        strcmp(status->valuestring, "error") == 0 ||
+        strcmp(status->valuestring, "disconnected") == 0);
+    if (!requested_is_valid || !commanded_is_valid || !status_is_valid) {
+        cJSON_Delete(root);
+        return false;
+    }
+    state = {
+        {static_cast<int16_t>(requested_rpm)},
+        static_cast<float>(commanded->valuedouble),
+        strcmp(status->valuestring, "moving") == 0,
+    };
+    cJSON_Delete(root);
+    return true;
+}
+
 void HypurpleControllerClient::handleCommunicationFailure()
 {
     portENTER_CRITICAL(&session_mux_);
     session_ = markPumpControllerOffline(session_);
-    const bool hanbuild_was_active = hanbuild_target_.rpm != 0;
-    hanbuild_target_ = stoppedHanBuildSpeedTarget();
-    hanbuild_write_pending_ = false;
-    ++hanbuild_revision_;
+    const bool hanbuild_was_active = hanbuild_session_.state.target.rpm != 0;
+    hanbuild_session_ = markHanBuildControllerOffline(hanbuild_session_);
     compressor_state_ = stoppedCompressorState();
     compressor_write_pending_ = false;
     ++compressor_revision_;
@@ -582,6 +677,9 @@ void HypurpleControllerClient::handleCommunicationFailure()
     }
     if (compressor_callback_ != nullptr) {
         compressor_callback_(stoppedCompressorState());
+    }
+    if (hanbuild_callback_ != nullptr) {
+        hanbuild_callback_(stoppedHanBuildRuntimeState());
     }
     if (hanbuild_was_active && hanbuild_safety_stop_callback_ != nullptr) {
         hanbuild_safety_stop_callback_();

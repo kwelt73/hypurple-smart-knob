@@ -1,6 +1,7 @@
 #include <cassert>
 
 #include "../src/pump_control_state.h"
+#include "../src/smart_knob_navigation.h"
 
 int main()
 {
@@ -87,4 +88,64 @@ int main()
     racing_poll = reconcilePumpControllerResponse(racing_poll, {0, false}, poll_revision);
     assert(racing_poll.state.desired_percent == 10);
     assert(racing_poll.dirty);
+
+    auto hanbuild = beginHanBuildControllerSession();
+    assert(hanbuild.read_before_write);
+    assert(hanbuild.state.target.rpm == 0);
+    const auto ignored_before_read = applyHanBuildUserInteraction(hanbuild, {60});
+    assert(ignored_before_read.state.target.rpm == 0);
+
+    hanbuild = reconcileHanBuildControllerResponse(
+        hanbuild,
+        {{50}, 48.5F, true},
+        hanbuild.revision);
+    assert(hanbuild.connected);
+    assert(!hanbuild.read_before_write);
+    assert(hanbuild.state.target.rpm == 50);
+    assert(hanbuild.state.commanded_rpm == 48.5F);
+    assert(hanbuild.state.moving);
+
+    const uint32_t stale_poll_revision = hanbuild.revision;
+    hanbuild = applyHanBuildUserInteraction(hanbuild, {51});
+    assert(hanbuild.dirty);
+    hanbuild = reconcileHanBuildControllerResponse(
+        hanbuild,
+        {{50}, 50.0F, true},
+        stale_poll_revision);
+    assert(hanbuild.state.target.rpm == 51);
+    assert(hanbuild.dirty);
+
+    const uint32_t hanbuild_command_revision = hanbuild.revision;
+    hanbuild = reconcileHanBuildControllerResponse(
+        hanbuild,
+        {{51}, 51.0F, true},
+        hanbuild_command_revision);
+    assert(hanbuild.state.target.rpm == 51);
+    assert(!hanbuild.dirty);
+
+    hanbuild = reconcileHanBuildControllerResponse(
+        hanbuild,
+        {{0}, 0.0F, false},
+        hanbuild.revision,
+        false);
+    assert(hanbuild.state.target.rpm == 51);
+    hanbuild = acknowledgeHanBuildCommand(hanbuild, hanbuild.revision);
+    assert(!hanbuild.dirty);
+    hanbuild = reconcileHanBuildControllerResponse(
+        hanbuild,
+        {{0}, 0.0F, false},
+        hanbuild.revision,
+        true);
+    assert(hanbuild.state.target.rpm == 0);
+    assert(!hanbuild.state.moving);
+
+    hanbuild = applyHanBuildUserInteraction(hanbuild, {-60});
+    assert(hanbuild.state.target.rpm == -60);
+    hanbuild = markHanBuildControllerOffline(hanbuild);
+    assert(!hanbuild.connected);
+    assert(hanbuild.read_before_write);
+    assert(!hanbuild.dirty);
+    assert(hanbuild.state.target.rpm == 0);
+    const auto ignored_offline_hanbuild = applyHanBuildUserInteraction(hanbuild, {-61});
+    assert(ignored_offline_hanbuild.state.target.rpm == 0);
 }
